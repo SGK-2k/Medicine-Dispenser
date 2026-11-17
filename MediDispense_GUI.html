@@ -1,0 +1,1014 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MediDispense - Doctor Console</title>
+<style>
+  :root{
+    --bg:#f3f5f7; --card:#fff; --ink:#17212b; --muted:#5f6b77; --line:#e2e7ec;
+    --primary:#0f766e; --primary-soft:#e6f4f2;
+    --l1:#15803d; --l1-soft:#e8f6ec;
+    --l2:#b45309; --l2-soft:#fdf3e4;
+    --l3:#b91c1c; --l3-soft:#fdecec;
+    --blue:#1d4ed8; --blue-soft:#e8eefc;
+    --violet:#4338ca; --violet-soft:#eef0ff;
+    --radius:14px;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+  button{font:inherit;cursor:pointer}
+  button:disabled{cursor:not-allowed;opacity:.45}
+  h2{margin:0 0 4px;font-size:15px}
+  .sub{margin:0 0 14px;color:var(--muted);font-size:13px}
+  .muted{color:var(--muted)}
+
+  /* header */
+  header{display:flex;align-items:center;gap:12px;padding:14px 24px;background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5;flex-wrap:wrap}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:17px}
+  .logo{width:32px;height:32px;border-radius:9px;background:var(--primary);display:grid;place-items:center}
+  .brand small{display:block;font-weight:400;font-size:12px;color:var(--muted)}
+  .spacer{flex:1}
+  .pill{display:inline-flex;align-items:center;gap:7px;padding:5px 12px;border-radius:99px;font-size:13px;font-weight:600;background:#eef1f4;color:var(--muted)}
+  .pill .dot{width:8px;height:8px;border-radius:50%;background:#9aa5b1}
+  .pill.ok{background:var(--l1-soft);color:var(--l1)} .pill.ok .dot{background:var(--l1)}
+  .pill.demo{background:var(--violet-soft);color:var(--violet)} .pill.demo .dot{background:var(--violet)}
+  .pill.wait{background:var(--l2-soft);color:var(--l2)} .pill.wait .dot{background:var(--l2)}
+  .pill.doc{background:var(--blue-soft);color:var(--blue)} .pill.doc .dot{background:var(--blue)}
+  .btn{border:1px solid var(--line);background:var(--card);color:var(--ink);padding:8px 14px;border-radius:10px;font-weight:600}
+  .btn:hover:not(:disabled){border-color:#c6cfd8}
+  .btn.primary{background:var(--primary);border-color:var(--primary);color:#fff}
+  .btn.warn{background:var(--l2);border-color:var(--l2);color:#fff}
+  .btn.danger{color:var(--l3)}
+  .btn.small{padding:5px 10px;font-size:13px}
+  .link{background:none;border:0;color:var(--primary);padding:0;font-weight:600;text-decoration:underline}
+
+  #banner{display:none;margin:16px 24px 0;padding:12px 16px;border-radius:12px;font-weight:500}
+  #banner.show{display:block}
+  #banner.warn{background:var(--l2-soft);color:#7c3a06;border:1px solid #f3d6a8}
+  #banner.err{background:var(--l3-soft);color:#7f1414;border:1px solid #f2c0c0}
+  #banner.info{background:var(--primary-soft);color:#0b4f4a;border:1px solid #bfe3dd}
+
+  main{display:grid;grid-template-columns:360px 1fr;gap:20px;padding:20px 24px 40px;max-width:1360px;margin:0 auto}
+  @media (max-width:1000px){main{grid-template-columns:1fr}}
+  .col{display:flex;flex-direction:column;gap:20px;min-width:0}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:18px}
+
+  /* dispenser mirror */
+  .lcd{background:#2f5d1f;border-radius:10px;padding:12px;border:6px solid #1d2a17;box-shadow:inset 0 0 18px rgba(0,0,0,.35)}
+  .lcd-row{display:grid;grid-template-columns:repeat(16,1fr);gap:2px}
+  .lcd-row+.lcd-row{margin-top:3px}
+  .lcd-cell{aspect-ratio:5/8;background:rgba(160,220,120,.10);color:#d8ffb8;font:600 15px/1 ui-monospace,Consolas,monospace;display:grid;place-items:center;text-shadow:0 0 6px rgba(200,255,160,.55)}
+  .lcd.off .lcd-cell{color:transparent;text-shadow:none}
+  .leds{display:flex;gap:18px;margin-top:14px}
+  .led{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted)}
+  .led i{width:15px;height:15px;border-radius:50%;background:#d5dbe1}
+  .led.g.on i{background:#22c55e;box-shadow:0 0 10px #22c55e}
+  .led.y.on i{background:#facc15;box-shadow:0 0 10px #facc15}
+  .led.r.on i{background:#ef4444;box-shadow:0 0 10px #ef4444}
+  .mode{margin-top:14px;padding:10px 12px;border-radius:10px;background:#f6f8fa;font-weight:600;font-size:13.5px}
+  .mode small{display:block;font-weight:400;color:var(--muted)}
+
+  .slots{display:flex;flex-direction:column;gap:8px}
+  .slotrow{display:grid;grid-template-columns:auto 1fr auto;gap:10px;align-items:center;padding:10px 12px;border:1px solid var(--line);border-radius:10px}
+  .slotnum{width:30px;height:30px;border-radius:8px;display:grid;place-items:center;font-weight:800;color:#fff}
+  .slotnum.b1{background:var(--l1)} .slotnum.b2{background:var(--l2)} .slotnum.b3{background:var(--l3)}
+  .slotmed{font-weight:600;font-size:13.5px}
+  .slotmed small{display:block;font-weight:400;color:var(--muted);font-size:12px}
+  .ir{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);white-space:nowrap}
+  .ir i{width:10px;height:10px;border-radius:50%;background:#d5dbe1}
+  .ir.on i{background:#0ea5e9;box-shadow:0 0 8px #0ea5e9}
+
+  .checks{list-style:none;margin:0;padding:0;font-size:13px}
+  .checks li{display:flex;gap:8px;padding:5px 0;border-bottom:1px solid #f0f2f4}
+  .checks li:last-child{border-bottom:0}
+  .checks b{min-width:66px}
+
+  .tag{display:inline-block;padding:2px 8px;border-radius:6px;font-size:12px;font-weight:700;white-space:nowrap}
+  .tag.ok{background:var(--l1-soft);color:var(--l1)}
+  .tag.warn{background:var(--l2-soft);color:var(--l2)}
+  .tag.err{background:var(--l3-soft);color:var(--l3)}
+  .tag.info{background:#eef1f4;color:#4b5563}
+  .tag.blue{background:var(--blue-soft);color:var(--blue)}
+
+  /* login */
+  .center-card{max-width:440px}
+  .pin-input{width:160px;padding:10px 12px;font:600 20px/1 ui-monospace,Consolas,monospace;letter-spacing:.4em;border:1px solid #cdd5dd;border-radius:10px;text-align:center}
+  .pin-input:focus{outline:2px solid var(--primary);outline-offset:1px}
+  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .empty{color:var(--muted);padding:22px;border:1px dashed var(--line);border-radius:12px;text-align:center}
+
+  /* patients */
+  .patients{display:flex;gap:8px;flex-wrap:wrap}
+  .pchip{display:flex;flex-direction:column;align-items:flex-start;gap:3px;padding:10px 14px;border:2px solid var(--line);border-radius:12px;background:#fff;min-width:130px;text-align:left}
+  .pchip b{font-size:14px}
+  .pchip.sel{border-color:var(--primary);background:var(--primary-soft)}
+  .pchip.add{border-style:dashed;color:var(--primary);font-weight:700;justify-content:center;align-items:center}
+
+  /* prescription form */
+  .levels{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+  @media (max-width:760px){.levels{grid-template-columns:1fr}}
+  .lvl{border:2px solid var(--line);border-radius:14px;padding:14px}
+  .lvl.l1{--c:var(--l1);--s:var(--l1-soft)} .lvl.l2{--c:var(--l2);--s:var(--l2-soft)} .lvl.l3{--c:var(--l3);--s:var(--l3-soft)}
+  .lvl.has{border-color:var(--c);background:var(--s)}
+  .lvl h3{margin:0;font-size:12px;letter-spacing:.06em;color:var(--c)}
+  .lvl .bx{font-size:16px;font-weight:700;margin:2px 0 10px}
+  .opt{display:flex;align-items:center;gap:8px;padding:6px 4px;border-radius:8px;cursor:pointer;font-size:13.5px}
+  .opt:hover{background:rgba(0,0,0,.03)}
+  .opt input{accent-color:var(--c)}
+  .who{font-size:12px;color:var(--muted);margin-top:8px}
+  .alert{padding:14px 16px;border-radius:12px;margin:16px 0}
+  .alert.warn{background:var(--l2-soft);border:1px solid #f3d6a8;color:#6b3407}
+  .alert.info{background:var(--blue-soft);border:1px solid #c7d6f8;color:#1e3a8a}
+  .alert.ok{background:var(--l1-soft);border:1px solid #bfe5c9;color:#14532d}
+  .alert h4{margin:0 0 6px;font-size:14px}
+  .alert ul{margin:6px 0 0;padding-left:18px}
+
+  /* progress */
+  .steps{display:flex;gap:6px;margin:6px 0 16px;flex-wrap:wrap}
+  .stepx{flex:1;min-width:110px;padding:8px 10px;border-radius:10px;background:#f1f3f5;color:#9aa5b1;font-size:12.5px;font-weight:700;text-align:center}
+  .stepx.done{background:var(--l1-soft);color:var(--l1)}
+  .stepx.now{background:var(--primary);color:#fff}
+  .fill{display:flex;flex-direction:column;gap:8px}
+  .fillrow{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;padding:12px;border:1px solid var(--line);border-radius:12px}
+  .fillrow.cur{border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-soft)}
+
+  /* demo */
+  .demo{display:none;border:1px dashed #c7c9f5;background:#f7f7ff}
+  .demo.show{display:block}
+  .demo h2{color:var(--violet)}
+  .demo-grid{display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start}
+  .keypad{display:grid;grid-template-columns:repeat(4,40px);gap:6px}
+  .keypad button{height:36px;border-radius:8px;border:1px solid #cfd3f5;background:#fff;font-weight:700}
+  .stack{display:flex;flex-direction:column;gap:6px}
+  .irbtn.on{background:#e0f2fe;border-color:#7dd3fc}
+
+  /* activity + console */
+  .table-wrap{max-height:320px;overflow:auto;border:1px solid var(--line);border-radius:10px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{position:sticky;top:0;background:#f8fafb;text-align:left;font-weight:600;color:var(--muted);padding:9px 12px;border-bottom:1px solid var(--line)}
+  td{padding:9px 12px;border-bottom:1px solid #eef1f4;vertical-align:top}
+  td.time{white-space:nowrap;color:var(--muted);font-variant-numeric:tabular-nums}
+  details.card summary{cursor:pointer;font-weight:700;font-size:15px}
+  #console{margin:12px 0 10px;height:220px;overflow:auto;background:#0f1720;color:#cfe3f2;border-radius:10px;padding:10px 12px;font:12.5px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap}
+  #console .tx{color:#7dd3fc} #console .evt{color:#a7f3d0} #console .sys{color:#fcd34d}
+  .cmd-row{display:flex;gap:8px}
+  .cmd-row input{flex:1;padding:8px 10px;border:1px solid #cdd5dd;border-radius:10px;font:13px ui-monospace,Consolas,monospace}
+  #toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%) translateY(20px);opacity:0;background:#17212b;color:#fff;padding:10px 16px;border-radius:10px;font-weight:500;transition:.2s;pointer-events:none;z-index:20;max-width:90vw}
+  #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <div class="logo"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></div>
+    <div>MediDispense<small>Doctor console for the Pico W dispenser</small></div>
+  </div>
+  <div class="spacer"></div>
+  <span id="docPill" class="pill doc" style="display:none"><span class="dot"></span><span id="docText"></span></span>
+  <button id="btnLogout" class="btn small" style="display:none">Log out</button>
+  <span id="connPill" class="pill"><span class="dot"></span><span id="connText">Not connected</span></span>
+  <button id="btnConnect" class="btn primary">Connect dispenser</button>
+  <button id="btnDemo" class="btn">Demo mode</button>
+  <button id="btnDisconnect" class="btn danger" style="display:none">Disconnect</button>
+</header>
+
+<div id="banner"></div>
+
+<main>
+  <!-- ============ LEFT: live dispenser ============ -->
+  <div class="col">
+    <section class="card">
+      <h2>Dispenser</h2>
+      <p class="sub">Live copy of the dispenser's screen.</p>
+      <div id="lcd" class="lcd off"><div class="lcd-row" id="lcdRow0"></div><div class="lcd-row" id="lcdRow1"></div></div>
+      <div class="mode" id="modeBox">Offline</div>
+    </section>
+
+    <section class="card">
+      <h2>Boxes</h2>
+      <p class="sub">What each box should hold, and what its IR sensor sees.</p>
+      <div class="slots" id="slots"></div>
+    </section>
+
+    <section class="card">
+      <h2>Start-up check</h2>
+      <p class="sub" id="checkSub">Runs every time the dispenser starts.</p>
+      <ul class="checks" id="checks"></ul>
+    </section>
+  </div>
+
+  <!-- ============ RIGHT: doctor workflow ============ -->
+  <div class="col">
+    <div id="mainArea"></div>
+
+    <section class="card demo" id="demoCard">
+      <h2>Demo: pretend you are at the dispenser</h2>
+      <p class="sub">The refill code is 1234. Patient PIN 1111, Head Nurse 3333, Doctor 4444.</p>
+      <div class="demo-grid">
+        <div><div class="muted" style="margin-bottom:6px;font-size:12.5px">Keypad</div><div class="keypad" id="demoKeypad"></div></div>
+        <div><div class="muted" style="margin-bottom:6px;font-size:12.5px">IR sensors (put medicine in / take it out)</div><div class="stack" id="demoIr"></div></div>
+        <div><div class="muted" style="margin-bottom:6px;font-size:12.5px">Tap an RFID card</div><div class="stack" id="demoCards"></div></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="row" style="margin-bottom:12px"><h2 style="margin:0">Activity</h2><div class="spacer"></div>
+        <button class="btn small" id="btnExport">Export CSV</button><button class="btn small" id="btnClearLog">Clear</button></div>
+      <div class="table-wrap"><table><thead><tr><th>Time</th><th>Event</th><th>Details</th></tr></thead><tbody id="actBody"></tbody></table></div>
+    </section>
+
+    <details class="card">
+      <summary>Serial console</summary>
+      <div id="console"></div>
+      <div class="cmd-row"><input id="cmdInput" placeholder="e.g. STATUS, HISTORY, PING" autocomplete="off"><button class="btn" id="btnSendCmd">Send</button></div>
+    </details>
+  </div>
+</main>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+
+/* =====================================================================
+   1. MEDICINE LIST BY SEVERITY  (one level = one box)
+   ===================================================================== */
+const LEVELS = {
+  1: { title: "LEVEL 1 · BOX 1", name: "General",        meds: ["Paracetamol 500 mg", "ORS sachet", "Antacid tablet", "Cetirizine 10 mg"] },
+  2: { title: "LEVEL 2 · BOX 2", name: "Severe",         meds: ["Amoxicillin 500 mg", "Azithromycin 500 mg", "Metformin 500 mg", "Amlodipine 5 mg"] },
+  3: { title: "LEVEL 3 · BOX 3", name: "High severity",  meds: ["Morphine 10 mg", "Tramadol 50 mg", "Lorazepam 1 mg"] }
+};
+
+const MODE_TEXT = {
+  BOOT:        ["Starting up", "Running the start-up check"],
+  IDLE:        ["Waiting for a prescription", "Choose a patient and prescribe"],
+  REFILL_AUTH: ["Refill: waiting for the code", "Enter the refill code + # on the dispenser"],
+  REFILL:      ["Refilling", "Put each medicine in the open box"],
+  REFILL_DONE: ["Refill complete", "Enter the refill code + # again to finish"],
+  READY:       ["Ready to dispense", "Select a box and log in with card or PIN"],
+  AUTH:        ["Logging in", "Card or PIN for the selected box"],
+  DISPENSE:    ["Dispensing", "Box open - waiting for the medicine to be taken"],
+  COMPLETE:    ["All medicine dispensed", "Refill the same prescription (code on the dispenser) or prescribe again"],
+  RESET_AUTH:  ["Reset: waiting for the code", "Enter the refill code + # to open all boxes"],
+  RESET:       ["Reset: emptying boxes", "Remove everything from all open boxes"],
+  LOCKED:      ["Locked", "Too many wrong tries"]
+};
+
+const SLOT_TEXT = { EMPTY: ["Empty", "info"], AWAIT: ["Needs refill", "warn"], LOADED: ["Loaded", "blue"], DISPENSED: ["Dispensed", "ok"] };
+
+/* =====================================================================
+   2. STATE
+   ===================================================================== */
+const S = {
+  conn: "off", ready: false, fw: null,
+  mode: "BOOT", box: 0, pinLen: 0, attempts: 0,
+  lcd: ["", ""], leds: { G: false, Y: false, R: false },
+  ir: { 1: false, 2: false, 3: false },
+  slots: { 1: { st: "EMPTY", med: "-" }, 2: { st: "EMPTY", med: "-" }, 3: { st: "EMPTY", med: "-" } },
+  rx: null,                 // { patient, meds:{1,2,3} } as the dispenser reports it
+  doctor: null,             // doctor name when logged in
+  roles: [],
+  checks: [], checkDone: null,
+  needReset: false,
+  pendingPatient: null,     // patient whose prescription was sent and is waiting for a reset
+  selected: null,           // selected patient id in the GUI
+  draft: {}                 // patient id -> {1,2,3} medicine choices being edited
+};
+
+const STORE_KEY = "medidispense.v5";
+let store = { patients: [], nextId: 1, activity: [] };
+try { const s = JSON.parse(localStorage.getItem(STORE_KEY) || "null"); if (s && s.patients) store = s; } catch (e) {}
+function save() { try { localStorage.setItem(STORE_KEY, JSON.stringify(store)); } catch (e) {} }
+
+/* =====================================================================
+   3. HELPERS
+   ===================================================================== */
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" }[c]));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const timeStr = t => new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+function patch(el, html) { if (el._html !== html) { el._html = html; el.innerHTML = html; return true; } return false; }
+function toast(msg) { const t = $("toast"); t.textContent = msg; t.classList.add("show"); clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove("show"), 2800); }
+function banner(kind, html) { const b = $("banner"); if (!kind) { b.className = ""; b.innerHTML = ""; return; } b.className = "show " + kind; b.innerHTML = html; }
+
+/* patients */
+function patientByName(name) { return store.patients.find(p => p.name === name); }
+function patientById(id) { return store.patients.find(p => p.id === id); }
+function addPatient(name) {
+  const p = { id: store.nextId++, name: name || `Patient ${store.nextId - 1}`, rx: null, status: "new", boxes: {}, sentAt: null, log: [] };
+  store.patients.push(p); save(); return p;
+}
+function activePatient() { return S.rx ? patientByName(S.rx.patient) : null; }
+function rxBoxes(rx) { return [1, 2, 3].filter(b => rx && rx.meds[b] && rx.meds[b] !== "-"); }
+function rxComplete() {
+  if (!S.rx) return true;
+  const boxes = rxBoxes(S.rx);
+  return boxes.length > 0 && boxes.every(b => S.slots[b].st === "DISPENSED");
+}
+function plog(p, text) { if (p) { p.log.unshift({ t: Date.now(), text }); p.log.length = Math.min(p.log.length, 50); save(); } }
+
+/* activity */
+function addActivity(kind, event, details) {
+  store.activity.unshift({ t: Date.now(), kind, event, details: details || "" });
+  store.activity.length = Math.min(store.activity.length, 300);
+  save(); renderActivity();
+}
+function renderActivity() {
+  const a = store.activity;
+  $("actBody").innerHTML = a.length ? a.map(x => `<tr><td class="time">${esc(timeStr(x.t))}</td><td><span class="tag ${x.kind}">${esc(x.event)}</span></td><td>${esc(x.details)}</td></tr>`).join("")
+    : '<tr><td colspan="3" class="muted" style="text-align:center;padding:22px">No activity yet.</td></tr>';
+}
+function exportCSV() {
+  if (!store.activity.length) { toast("Nothing to export yet"); return; }
+  const rows = [["Date", "Time", "Event", "Details"]].concat(store.activity.slice().reverse().map(a => [new Date(a.t).toLocaleDateString(), timeStr(a.t), a.event, a.details]));
+  const csv = rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(",")).join("\r\n");
+  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+  const a = document.createElement("a"); a.href = url; a.download = "medidispense_activity.csv";
+  document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/* console */
+function consoleLine(text, cls) {
+  const c = $("console"), d = document.createElement("div");
+  if (cls) d.className = cls; d.textContent = text; c.appendChild(d);
+  while (c.childNodes.length > 600) c.removeChild(c.firstChild);
+  c.scrollTop = c.scrollHeight;
+}
+
+/* =====================================================================
+   4. TRANSPORT: USB (Web Serial) or Demo
+   ===================================================================== */
+let port = null, reader = null, readClosed = null, keepReading = false, sim = null, readyTimer = null;
+
+async function send(line) {
+  if (S.conn === "off") { toast("Connect the dispenser first"); return false; }
+  consoleLine("> " + line.replace(/^DOCLOGIN .*/, "DOCLOGIN ****"), "tx");
+  if (S.conn === "demo") { sim.command(line); return true; }
+  try {
+    const w = port.writable.getWriter();
+    await w.write(new TextEncoder().encode(line + "\n"));
+    w.releaseLock();
+    return true;
+  } catch (e) { consoleLine("! write failed: " + e.message, "sys"); toast("Could not send to the dispenser"); return false; }
+}
+
+async function connectSerial(showAll) {
+  if (!("serial" in navigator)) { banner("err", "This browser can't talk to USB devices. Open this file in <b>Google Chrome</b> or <b>Microsoft Edge</b> on a computer."); return; }
+  try {
+    port = await navigator.serial.requestPort({ filters: showAll ? [] : [{ usbVendorId: 0x2E8A }] });
+  } catch (e) {
+    if (e.name === "NotFoundError") {
+      if (!showAll) { banner("info", 'No Pico selected. If it was not listed, <button class="link" id="btnShowAll">show all USB ports</button>.'); $("btnShowAll").onclick = () => connectSerial(true); }
+      return;
+    }
+    if (e.name === "SecurityError") { banner("err", "USB access is blocked here. Download this file and open it directly in Chrome or Edge."); return; }
+    banner("err", "Could not choose a port: " + esc(e.message)); return;
+  }
+  try { await port.open({ baudRate: 115200 }); }
+  catch (e) { banner("err", "Could not open the port. Close the <b>Arduino Serial Monitor</b> (or any other program using the port) and try again."); port = null; return; }
+  try { await port.setSignals({ dataTerminalReady: true, requestToSend: true }); } catch (e) {}
+
+  S.conn = "serial"; S.ready = false; banner(null);
+  consoleLine("# USB port opened", "sys");
+  render(); readLoop();
+  await sleep(150);
+  send("HELLO");
+  clearTimeout(readyTimer);
+  readyTimer = setTimeout(() => {
+    if (S.conn === "serial" && !S.ready) banner("warn", "Connected, but the dispenser is not answering. Check that <b>Medicine_Dispenser.ino version 5</b> is uploaded, then Disconnect and Connect again.");
+  }, 3500);
+}
+
+async function readLoop() {
+  keepReading = true; let buf = "";
+  while (port && port.readable && keepReading) {
+    const dec = new TextDecoderStream();
+    readClosed = port.readable.pipeTo(dec.writable).catch(() => {});
+    reader = dec.readable.getReader();
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += value; let i;
+        while ((i = buf.indexOf("\n")) >= 0) { const line = buf.slice(0, i).replace(/\r$/, ""); buf = buf.slice(i + 1); handleLine(line); }
+      }
+    } catch (e) { consoleLine("! read error: " + e.message, "sys"); break; }
+    finally { try { reader.releaseLock(); } catch (e) {} }
+  }
+  if (S.conn === "serial") lostConnection("The dispenser was unplugged or stopped responding.");
+}
+
+async function disconnect() {
+  clearTimeout(readyTimer);
+  if (S.conn === "demo") { sim.stop(); sim = null; S.conn = "off"; resetLive(); consoleLine("# demo stopped", "sys"); banner(null); render(); return; }
+  S.conn = "off"; keepReading = false;
+  try { if (reader) await reader.cancel(); } catch (e) {}
+  try { if (readClosed) await readClosed; } catch (e) {}
+  try { if (port) await port.close(); } catch (e) {}
+  port = null; resetLive(); consoleLine("# USB port closed", "sys"); render();
+}
+
+function lostConnection(msg) {
+  S.conn = "off"; port = null; resetLive();
+  banner("warn", esc(msg) + " Plug it back in and click <b>Connect dispenser</b>.");
+  addActivity("err", "Disconnected", msg); render();
+}
+
+function resetLive() {
+  Object.assign(S, { ready: false, fw: null, mode: "BOOT", box: 0, pinLen: 0, lcd: ["", ""], leds: { G: false, Y: false, R: false },
+    ir: { 1: false, 2: false, 3: false }, rx: null, doctor: null, checks: [], checkDone: null, needReset: false });
+  for (const b of [1, 2, 3]) S.slots[b] = { st: "EMPTY", med: "-" };
+}
+
+if ("serial" in navigator) navigator.serial.addEventListener("disconnect", e => {
+  if (port && e.target === port && S.conn === "serial") { keepReading = false; lostConnection("The dispenser was unplugged."); }
+});
+
+function startDemo() {
+  if (S.conn !== "off") return;
+  resetLive();
+  sim = new Simulator(line => handleLine(line));
+  S.conn = "demo";
+  banner("info", "Demo mode: a simulated dispenser runs in this page. Use the demo panel to press keys, move medicine in and out of boxes, and tap cards.");
+  consoleLine("# demo started", "sys"); render(); sim.boot();
+}
+
+/* =====================================================================
+   5. PROTOCOL: lines from the dispenser
+   ===================================================================== */
+function handleLine(line) {
+  if (!line.startsWith("EVT ")) { if (line.trim()) consoleLine(line); return; }
+  consoleLine(line, "evt");
+  const body = line.slice(4), sp = body.indexOf(" ");
+  const type = sp < 0 ? body : body.slice(0, sp), rest = sp < 0 ? "" : body.slice(sp + 1), p = rest.split(" ");
+  const ap = activePatient();
+
+  switch (type) {
+    case "READY":
+      S.ready = true; S.fw = rest; S.roles = []; clearTimeout(readyTimer);
+      if ($("banner").classList.contains("warn")) banner(null);
+      addActivity("info", "Connected", (S.conn === "demo" ? "Demo dispenser" : "Dispenser") + " firmware " + rest);
+      break;
+    case "ROLE": { const n = p.slice(1).join(" "); if (!S.roles.some(r => r.name === n)) S.roles.push({ level: +p[0], name: n }); break; }
+    case "CHECK":
+      if (p[0] === "DONE") {
+        S.checkDone = +p[1];
+        addActivity(S.checkDone ? "err" : "ok", "Start-up check", S.checkDone ? `${S.checkDone} part(s) failed` : "All parts OK");
+      } else {
+        const i = S.checks.findIndex(c => c.part === p[0]);
+        const c = { part: p[0], res: p[1], detail: p.slice(2).join(" ") };
+        if (i >= 0) S.checks[i] = c; else S.checks.push(c);
+      }
+      break;
+    case "MODE": S.mode = p[0]; S.box = +p[1] || 0; if (S.mode !== "RESET_AUTH" && S.mode !== "RESET") S.needReset = false; break;
+    case "STATUS": S.attempts = +p[2] || 0; break;
+    case "DOC":
+      if (p[0] === "OK") { S.doctor = p.slice(1).join(" "); addActivity("ok", "Doctor logged in", S.doctor); }
+      else if (p[0] === "FAIL") { toast("Wrong doctor PIN"); addActivity("warn", "Doctor login failed", "Wrong PIN"); const i = $("docPin"); if (i) { i.value = ""; i.focus(); } }
+      else { if (S.doctor) addActivity("info", "Doctor logged out", S.doctor); S.doctor = null; }
+      break;
+    case "RX":
+      if (rest === "NONE") { S.rx = null; break; }
+      {
+        const parts = rest.split("|");
+        if (S.pendingPatient === parts[0]) S.pendingPatient = null;
+        S.rx = { patient: parts[0], meds: { 1: parts[1], 2: parts[2], 3: parts[3] } };
+        let pt = patientByName(parts[0]);
+        if (!pt) pt = addPatient(parts[0]);
+        if (pt.status !== "active") { pt.status = "active"; pt.rx = { 1: parts[1], 2: parts[2], 3: parts[3] }; pt.boxes = {}; plog(pt, "Prescription stored on the dispenser"); }
+        save();
+      }
+      break;
+    case "SLOT": {
+      const n = +p[0]; S.slots[n] = { st: p[1], med: p.slice(2).join(" ") };
+      if (ap && S.slots[n].med !== "-") { ap.boxes[n] = p[1]; save(); }
+      break;
+    }
+    case "IR": S.ir[+p[0]] = p[1] === "1"; break;
+    case "NEEDRESET": S.needReset = true; addActivity("warn", "Reset needed", "Medicine is still in the boxes - enter the refill code on the dispenser to empty them"); break;
+    case "CODE": break;
+    case "REFILL": S.box = +p[0];
+      if (ap && ap.status === "complete") { ap.status = "active"; plog(ap, "Refilling the same prescription"); save(); }
+      addActivity("info", "Refill", `Box ${p[0]} opened - put in ${S.slots[+p[0]].med}`); break;
+    case "LOADED": addActivity("ok", "Loaded", `Box ${p[0]} - ${S.slots[+p[0]].med}`); plog(ap, `Box ${p[0]} loaded with ${S.slots[+p[0]].med}`); break;
+    case "REFILLED": addActivity("ok", "Refill done", "All prescribed boxes are filled"); break;
+    case "DISPENSED": {
+      const n = +p[0], med = p.slice(1).join(" ");
+      addActivity("ok", "Medicine dispensed", `Box ${n} - ${med}` + (ap ? ` for ${ap.name}` : ""));
+      plog(ap, `Dispensed ${med} (Box ${n})`); toast(`Medicine dispensed: ${med}`);
+      break;
+    }
+    case "NOTTAKEN": addActivity("warn", "Not collected", `Box ${p[0]} closed without the medicine being taken`); plog(ap, `Box ${p[0]}: not collected`); break;
+    case "RXCOMPLETE": {
+      const pt = patientByName(rest); if (pt) { pt.status = "complete"; plog(pt, "All medicine dispensed"); save(); }
+      addActivity("ok", "Prescription complete", rest); toast(`${rest}: all medicine dispensed`); break;
+    }
+    case "EMPTIED":
+      if (ap && ap.status === "active") { ap.status = "incomplete"; plog(ap, "Boxes emptied before all medicine was dispensed"); save(); }
+      addActivity("info", "Emptied", "All boxes are empty"); break;
+    case "LCD": { const [a, b] = rest.split("|"); S.lcd = [a || "", b || ""]; break; }
+    case "LED": if (p[0] in S.leds) S.leds[p[0]] = p[1] === "1"; break;
+    case "PINLEN": S.pinLen = +p[0] || 0; break;
+    case "AUTH": addActivity("ok", "Logged in", `${p.slice(1).join(" ")} (${p[0] === "CARD" ? "RFID card" : p[0] === "PC" ? "PIN from PC" : "keypad PIN"}) for Box ${S.box}`); break;
+    case "FAIL": addActivity("warn", p[0] === "CODE" ? "Wrong code" : "Login failed", `${p[0] === "CARD" ? "Unknown card" : p[0] === "CODE" ? "Wrong refill code" : "Wrong PIN"} - try ${p[1]} of ${p[2]}`); break;
+    case "DENIED": addActivity("err", "Access denied", `${p.slice(1).join(" ")} may not open Box ${p[0]}`); break;
+    case "LOCK": addActivity("err", "Locked", `Too many wrong tries - locked for ${p[0]} s`); S.mode = "LOCKED"; break;
+    case "TIMEOUT": addActivity("warn", "Timed out", "No input for 30 s"); break;
+    case "ERR": addActivity("err", "Dispenser message", rest); toast(rest); break;
+    case "PONG": toast("Dispenser answered"); break;
+  }
+  render();
+}
+
+/* =====================================================================
+   6. RENDERING
+   ===================================================================== */
+function render() {
+  const connected = S.conn !== "off", live = connected && S.ready;
+
+  // header
+  $("connPill").className = "pill" + (S.conn === "demo" ? " demo" : live ? " ok" : connected ? " wait" : "");
+  $("connText").textContent = S.conn === "demo" ? "Demo dispenser" : live ? "Dispenser connected" : connected ? "Waiting for dispenser..." : "Not connected";
+  $("btnConnect").style.display = connected ? "none" : "";
+  $("btnDemo").style.display = connected ? "none" : "";
+  $("btnDisconnect").style.display = connected ? "" : "none";
+  $("btnDisconnect").textContent = S.conn === "demo" ? "Stop demo" : "Disconnect";
+  $("docPill").style.display = S.doctor ? "" : "none";
+  $("btnLogout").style.display = S.doctor ? "" : "none";
+  $("docText").textContent = S.doctor ? "Dr. logged in: " + S.doctor : "";
+
+  // LCD + LEDs
+  $("lcd").classList.toggle("off", !connected);
+  for (let r = 0; r < 2; r++) {
+    const t = (S.lcd[r] || "").padEnd(16).slice(0, 16);
+    patch($("lcdRow" + r), [...t].map(ch => `<span class="lcd-cell">${ch === " " ? "&nbsp;" : esc(ch)}</span>`).join(""));
+  }
+  const mt = MODE_TEXT[S.mode] || [S.mode, ""];
+  patch($("modeBox"), !live ? "Offline" : `${esc(mt[0])}${S.box && ["AUTH", "DISPENSE"].includes(S.mode) ? " · Box " + S.box : ""}<small>${esc(mt[1])}</small>`);
+
+  // boxes
+  patch($("slots"), [1, 2, 3].map(b => {
+    const s = S.slots[b], st = SLOT_TEXT[s.st] || [s.st, "info"];
+    return `<div class="slotrow"><span class="slotnum b${b}">${b}</span>
+      <span class="slotmed">${s.med !== "-" ? esc(s.med) : '<span class="muted">No medicine</span>'}<small>${LEVELS[b].name} · <span class="tag ${st[1]}">${st[0]}</span></small></span>
+      <span class="ir ${S.ir[b] ? "on" : ""}"><i></i>${S.ir[b] ? "Item inside" : "Empty"}</span></div>`;
+  }).join(""));
+
+  // checks
+  $("checkSub").textContent = S.checkDone === null ? "Runs every time the dispenser starts." : S.checkDone ? `${S.checkDone} part(s) failed - see below.` : "All parts passed.";
+  patch($("checks"), S.checks.length ? S.checks.map(c => `<li><b>${esc(c.part)}</b><span class="tag ${c.res === "OK" ? "ok" : c.res === "WARN" ? "warn" : "err"}">${esc(c.res)}</span><span class="muted">${esc(c.detail)}</span></li>`).join("")
+    : '<li class="muted">No results yet.</li>');
+
+  renderMain(live);
+  $("demoCard").classList.toggle("show", S.conn === "demo");
+  renderDemoIr();
+}
+
+function renderMain(live) {
+  const area = $("mainArea");
+  if (!live) {
+    patch(area, `<section class="card"><h2>Welcome</h2><p class="sub">Connect the dispenser with a USB cable, or try Demo mode.</p>
+      <div class="empty">${S.conn === "off" ? "Not connected." : "Waiting for the dispenser to answer..."}</div></section>`);
+    return;
+  }
+  if (!S.doctor) {
+    if (patch(area, `<section class="card center-card"><h2>Doctor login</h2><p class="sub">Enter your 4-digit doctor PIN. The dispenser checks it.</p>
+      <form id="docForm" class="row" autocomplete="off"><input id="docPin" class="pin-input" type="password" inputmode="numeric" maxlength="4" placeholder="••••" aria-label="Doctor PIN">
+      <button class="btn primary" type="submit">Log in</button></form></section>`)) {
+      $("docForm").onsubmit = e => { e.preventDefault(); const v = $("docPin").value.trim(); if (!/^\d{4}$/.test(v)) { toast("Enter 4 digits"); return; } send("DOCLOGIN " + v); };
+      $("docPin").oninput = e => { e.target.value = e.target.value.replace(/\D/g, "").slice(0, 4); };
+      setTimeout(() => $("docPin") && $("docPin").focus(), 0);
+    }
+    return;
+  }
+
+  if (S.selected === null || !patientById(S.selected)) {
+    const ap = activePatient();
+    S.selected = ap ? ap.id : (store.patients[0] ? store.patients[0].id : null);
+  }
+
+  const html = `
+    <section class="card">
+      <h2>Patients</h2><p class="sub">Select a patient, or add a new one.</p>
+      <div class="patients">${store.patients.map(pchip).join("")}<button class="pchip add" data-add="1">+ Add patient</button></div>
+    </section>
+    ${S.selected !== null ? patientCard(patientById(S.selected)) : '<section class="card"><div class="empty">Add a patient to start.</div></section>'}`;
+
+  if (patch(area, html)) wireMain();
+}
+
+function pchip(p) {
+  const ap = activePatient(), isActive = ap && ap.id === p.id;
+  const [txt, cls] = isActive ? (rxComplete() ? ["Completed", "ok"] : ["On dispenser", "blue"])
+    : p.status === "complete" ? ["Completed", "ok"] : p.status === "incomplete" ? ["Not finished", "warn"] : p.status === "active" ? ["Stopped", "warn"] : ["No prescription", "info"];
+  return `<button class="pchip ${S.selected === p.id ? "sel" : ""}" data-pid="${p.id}"><b>${esc(p.name)}</b><span class="tag ${cls}">${txt}</span></button>`;
+}
+
+function patientCard(p) {
+  const ap = activePatient();
+  const isActive = ap && ap.id === p.id;
+  if (isActive) return activeCard(p);
+  return prescribeCard(p, ap);
+}
+
+/* --- patient currently on the dispenser --- */
+function activeCard(p) {
+  const boxes = rxBoxes(S.rx);
+  const m = S.mode;
+  const phases = [["Prescribed", true], ["Refill", ["REFILL_AUTH", "REFILL", "REFILL_DONE"].includes(m)], ["Ready", ["READY", "AUTH", "DISPENSE", "LOCKED"].includes(m)], ["Completed", rxComplete()]];
+  let nowIdx = phases.findIndex((x, i) => i > 0 && x[1]); if (rxComplete()) nowIdx = 3; if (nowIdx < 0) nowIdx = 0;
+  if (["RESET_AUTH", "RESET"].includes(m)) nowIdx = -1;
+  const steps = phases.map((x, i) => `<div class="stepx ${i < nowIdx ? "done" : i === nowIdx ? "now" : ""}">${x[0]}</div>`).join("");
+
+  let guide = "";
+  if (m === "REFILL_AUTH") guide = `<div class="alert info"><h4>Refill phase</h4>The dispenser shows <b>REFILLING</b>. Enter the refill code and press <b>#</b> on its keypad. Only the boxes below will open, one at a time.</div>`;
+  else if (m === "REFILL") guide = `<div class="alert info"><h4>Box ${S.box || ""} is open</h4>Put the medicine shown below into the open box. The IR sensor detects it and the box closes 5 seconds later, then the next box opens.</div>`;
+  else if (m === "REFILL_DONE") guide = `<div class="alert ok"><h4>All boxes filled</h4>Enter the refill code and press <b>#</b> again on the dispenser to finish. It will then show <b>Dispenser Ready</b>.</div>`;
+  else if (["READY", "AUTH", "DISPENSE"].includes(m)) guide = `<div class="alert ok"><h4>Ready to dispense</h4>At the dispenser: choose a box, then log in with an RFID card or PIN. The box opens and closes 5 s after the medicine is taken.</div>`;
+  else if (rxComplete() || m === "COMPLETE") guide = `<div class="alert ok"><h4>All medicine dispensed</h4>The dispenser shows <b>All dispensed - Refill/Prescribe</b> and no box can be opened. Either prescribe again (for ${esc(p.name)} or another patient), or enter the refill code + # on the dispenser to refill the same prescription.</div>`;
+  else if (["RESET_AUTH", "RESET"].includes(m)) guide = `<div class="alert warn"><h4>Reset mode</h4>${m === "RESET_AUTH" ? "Enter the refill code and press # on the dispenser. All boxes will open." : "All boxes are open. Take everything out; when every IR sensor reads empty the dispenser shows <b>Emptied</b>."}</div>`;
+
+  const rows = boxes.map(b => {
+    const st = S.slots[b].st, t = SLOT_TEXT[st] || [st, "info"];
+    const cur = (m === "REFILL" && S.box === b) || (m === "DISPENSE" && S.box === b);
+    return `<div class="fillrow ${cur ? "cur" : ""}"><span class="slotnum b${b}">${b}</span>
+      <span><b>${esc(S.rx.meds[b])}</b><br><span class="muted" style="font-size:12.5px">${m.startsWith("REFILL") && st === "AWAIT" ? "Fill into Box " + b + " (" + LEVELS[b].name + ")" : "Box " + b + " · " + LEVELS[b].name}</span></span>
+      <span class="tag ${t[1]}">${t[0]}</span></div>`;
+  }).join("");
+
+  return `<section class="card">
+    <div class="row" style="margin-bottom:6px"><h2 style="margin:0">${esc(p.name)}</h2><span class="tag blue">On dispenser</span></div>
+    <p class="sub">Prescription stored on the dispenser. Progress updates live.</p>
+    <div class="steps">${steps}</div>
+    ${guide}
+    <h2 style="font-size:14px;margin-top:6px">Which medicine goes in which box</h2>
+    <div class="fill" style="margin-top:10px">${rows}</div>
+    ${patientLog(p)}
+  </section>`;
+}
+
+/* --- any other patient: prescribe --- */
+function prescribeCard(p, ap) {
+  const d = S.draft[p.id] || (S.draft[p.id] = { 1: p.rx && p.status !== "complete" ? p.rx[1] : "-", 2: p.rx && p.status !== "complete" ? p.rx[2] : "-", 3: p.rx && p.status !== "complete" ? p.rx[3] : "-" });
+  const chosen = [1, 2, 3].filter(b => d[b] && d[b] !== "-");
+
+  const levels = [1, 2, 3].map(b => {
+    const L = LEVELS[b], who = S.roles.filter(r => r.level >= b).map(r => r.name).join(", ") || "-";
+    const has = d[b] && d[b] !== "-";
+    return `<div class="lvl l${b} ${has ? "has" : ""}"><h3>${L.title}</h3><div class="bx">${L.name}</div>
+      <label class="opt"><input type="radio" name="m${b}" value="-" ${!has ? "checked" : ""}>None</label>
+      ${L.meds.map(m => `<label class="opt"><input type="radio" name="m${b}" value="${esc(m)}" ${d[b] === m ? "checked" : ""}>${esc(m)}</label>`).join("")}
+      <div class="who">Can be collected by: ${esc(who)}</div></div>`;
+  }).join("");
+
+  const busy = ["REFILL", "DISPENSE", "RESET"].includes(S.mode) || S.mode === "LOCKED";
+  let pre = "", label = "Send prescription to dispenser", cls = "primary";
+  const loaded = [1, 2, 3].some(b => S.slots[b].st === "LOADED");
+  if (ap && !rxComplete()) {
+    const list = rxBoxes(S.rx).map(b => `<li>Box ${b}: ${esc(S.rx.meds[b])} - <b>${(SLOT_TEXT[S.slots[b].st] || [S.slots[b].st])[0]}</b></li>`).join("");
+    pre = loaded
+      ? `<div class="alert warn"><h4>${esc(ap.name)}'s prescription is not finished</h4>Current status on the dispenser:<ul>${list}</ul>
+         <div style="margin-top:8px">Proceeding puts the dispenser in <b>reset mode</b>: after the refill code is entered, all boxes open so the remaining medicine can be taken out. When the IR sensors read empty it shows <b>Emptied</b> and starts the refill for ${esc(p.name)}.</div></div>`
+      : `<div class="alert info"><h4>${esc(ap.name)}'s prescription has not been loaded yet</h4>Nothing is in the boxes, so ${esc(p.name)}'s prescription replaces it and the refill starts straight away (no reset needed).<ul>${list}</ul></div>`;
+    label = `Proceed with ${p.name}`; cls = loaded ? "warn" : "primary";
+  } else if (ap && rxComplete()) {
+    pre = `<div class="alert ok">${esc(ap.name)}'s medicine has all been dispensed. The dispenser is free.</div>`;
+  }
+  if (S.pendingPatient === p.name && ["RESET_AUTH", "RESET"].includes(S.mode)) {
+    pre = `<div class="alert info"><h4>Waiting for the reset</h4>The prescription for ${esc(p.name)} has been sent. The dispenser is in reset mode: enter the refill code on it, empty all boxes, and the refill for ${esc(p.name)} starts automatically.</div>`;
+    label = "Send again"; cls = "primary";
+  }
+  if (p.status === "complete") pre = `<div class="alert ok">${esc(p.name)}'s last prescription was completed. You can prescribe again.</div>` + pre;
+  if (p.status === "incomplete") pre = `<div class="alert warn">${esc(p.name)}'s last prescription was stopped before all medicine was dispensed.</div>` + pre;
+
+  return `<section class="card">
+    <div class="row" style="margin-bottom:6px"><h2 style="margin:0">${esc(p.name)}</h2></div>
+    <p class="sub">Choose at most one medicine per severity level. Each level has its own box.</p>
+    ${pre}
+    <div class="levels">${levels}</div>
+    <div class="row" style="margin-top:16px">
+      <button class="btn ${cls}" id="btnSend" ${chosen.length && !busy ? "" : "disabled"}>${esc(label)}</button>
+      <span class="muted" style="font-size:12.5px">${busy ? "The dispenser is busy - wait until the boxes are closed." : chosen.length ? chosen.map(b => `Box ${b}: ${d[b]}`).join(" · ") : "Pick at least one medicine."}</span>
+    </div>
+    ${patientLog(p)}
+  </section>`;
+}
+
+function patientLog(p) {
+  if (!p.log.length) return "";
+  return `<h2 style="font-size:14px;margin-top:18px">History for ${esc(p.name)}</h2>
+    <div class="table-wrap" style="max-height:180px;margin-top:8px"><table><tbody>${p.log.map(l => `<tr><td class="time">${esc(timeStr(l.t))}</td><td>${esc(l.text)}</td></tr>`).join("")}</tbody></table></div>`;
+}
+
+function wireMain() {
+  document.querySelectorAll("[data-pid]").forEach(el => el.onclick = () => { S.selected = +el.dataset.pid; render(); });
+  const add = document.querySelector("[data-add]");
+  if (add) add.onclick = () => { const p = addPatient(); S.selected = p.id; addActivity("info", "Patient added", p.name); render(); };
+  document.querySelectorAll('.lvl input[type=radio]').forEach(r => r.onchange = () => {
+    const b = +r.name.slice(1); S.draft[S.selected][b] = r.value; render();
+  });
+  const btn = $("btnSend");
+  if (btn) btn.onclick = () => {
+    const p = patientById(S.selected), d = S.draft[p.id];
+    const line = `RX ${p.name}|${d[1] || "-"}|${d[2] || "-"}|${d[3] || "-"}`;
+    plog(p, "Prescription sent: " + [1, 2, 3].filter(b => d[b] && d[b] !== "-").map(b => `Box ${b} ${d[b]}`).join(", "));
+    addActivity("info", "Prescription sent", `${p.name}: ` + [1, 2, 3].filter(b => d[b] && d[b] !== "-").map(b => d[b]).join(", "));
+    p.status = "sent"; p.rx = { 1: d[1], 2: d[2], 3: d[3] }; save();
+    S.pendingPatient = p.name;
+    delete S.draft[p.id];
+    send(line);
+  };
+}
+
+setInterval(() => { if (S.conn !== "off") render(); }, 1000);
+
+/* =====================================================================
+   7. DEMO SIMULATOR - behaves like Medicine_Dispenser.ino v5
+   ===================================================================== */
+class Simulator {
+  constructor(out) {
+    this.out = out;
+    this.users = [
+      { name: "Patient", pin: "1111", uid: "9DB9BE21", level: 1, doc: false },
+      { name: "Head Nurse", pin: "3333", uid: "F3A0EEE3", level: 2, doc: false },
+      { name: "Doctor", pin: "4444", uid: "CFDE401C", level: 3, doc: true }
+    ];
+    this.NAMES = ["", "General", "Severe", "High Sev"];
+    this.CODE = "1234"; this.CLOSE = 5000; this.COLLECT = 30000; this.EMPTY = 3000; this.LOGIN = 30000; this.MAX = 3; this.LOCK = 10;
+    this.slots = { 1: { med: "-", pres: false, st: "EMPTY" }, 2: { med: "-", pres: false, st: "EMPTY" }, 3: { med: "-", pres: false, st: "EMPTY" } };
+    this.ir = { 1: false, 2: false, 3: false };
+    this.rx = null; this.pending = null; this.doctor = null;
+    this.mode = "BOOT"; this.box = 0; this.pin = ""; this.attempts = 0; this.locked = false; this.idleMsg = "Waiting for Rx";
+    this.lcd = ["", ""]; this.leds = { G: 0, Y: 0, R: 0 };
+    this.chain = Promise.resolve(); this.alive = true; this.t = {};
+    this.timer = setInterval(() => { if (!this.busyTick) { this.busyTick = true; this.q(async () => { await this.update(); this.busyTick = false; }); } }, 150);
+  }
+  stop() { this.alive = false; clearInterval(this.timer); }
+  emit(s) { if (this.alive) setTimeout(() => this.out("EVT " + s), 0); }
+  log(s) { if (this.alive) setTimeout(() => this.out(s), 0); }
+  wait(ms) { return sleep(ms); }
+  q(fn) { this.chain = this.chain.then(() => this.alive && fn()).catch(e => { console.error(e); }); }
+
+  show(a, b) { a = a.slice(0, 16); b = b.slice(0, 16); if (a === this.lcd[0] && b === this.lcd[1]) return; this.lcd = [a, b]; this.emit(`LCD ${a}|${b}`); }
+  async ok() { await this.wait(200); }
+  async no() { await this.wait(500); }
+  slot(b, st) { this.slots[b].st = st; this.emitSlot(b); }
+  emitSlot(b) { const s = this.slots[b]; this.emit(`SLOT ${b} ${s.st} ${s.med}`); }
+  servo(b, open) { this.emit((open ? "OPEN " : "CLOSE ") + b); }
+  sendRx() { this.emit(this.rx ? `RX ${this.rx.patient}|${this.rx.m[1]}|${this.rx.m[2]}|${this.rx.m[3]}` : "RX NONE"); }
+  anyPresent() { return [1, 2, 3].some(b => this.ir[b]); }
+
+  setMode(m) { this.mode = m; this.emit(`MODE ${m} ${this.box}`); this.enter(m); }
+  enter(m) {
+    if (m === "IDLE") { this.box = 0; this.pin = ""; this.attempts = 0; this.redraw(); }
+    else if (["REFILL_AUTH", "REFILL_DONE", "RESET_AUTH", "COMPLETE"].includes(m)) { this.pin = ""; this.attempts = 0; this.redraw(); }
+    else if (m === "REFILL") { this.queue = [1, 2, 3].filter(b => this.slots[b].pres); this.nextRefill(); }
+    else if (m === "READY") { this.box = 0; this.pin = ""; this.attempts = 0; this.redraw(); }
+    else if (m === "AUTH") { this.pin = ""; this.t.act = Date.now(); this.redraw(); }
+    else if (m === "DISPENSE") { this.servo(this.box, true); this.t.open = Date.now(); this.t.taken = 0; this.show("Take medicine", this.slots[this.box].med); }
+    else if (m === "RESET") { for (const b of [1, 2, 3]) this.servo(b, true); this.t.empty = 0; }
+  }
+  redraw() {
+    const m = this.mode, titles = { REFILL_AUTH: "REFILLING", REFILL_DONE: "Refill complete", RESET_AUTH: "RESET MODE" };
+    if (m === "IDLE") this.show("System Ready", this.idleMsg);
+    else if (m === "COMPLETE") { if (this.pin) { this.show("Refill: code", "Code: " + "*".repeat(this.pin.length)); } else this.show("All dispensed", "Refill/Prescribe"); this.emit("PINLEN " + this.pin.length); }
+    else if (titles[m]) { this.show(titles[m], this.pin ? "Code: " + "*".repeat(this.pin.length) : "Code + #"); this.emit("PINLEN " + this.pin.length); }
+    else if (m === "READY") this.show("Dispenser Ready", "Select Box 1-3");
+    else if (m === "AUTH") { this.show(`Box${this.box}:${this.NAMES[this.box]}`, this.pin ? "PIN: " + "*".repeat(this.pin.length) : "Card/PIN# 0=Exit"); this.emit("PINLEN " + this.pin.length); }
+    else if (m === "REFILL" && this.box) this.show("REFILLING Box " + this.box, this.slots[this.box].med);
+  }
+  hello() {
+    this.emit("READY 6.2-demo");
+    for (let b = 1; b <= 3; b++) this.emit(`BOX ${b} ${this.NAMES[b]}`);
+    for (const u of this.users) this.emit(`ROLE ${u.level} ${u.name}`);
+  }
+  status() {
+    this.emit(`MODE ${this.mode} ${this.box}`);
+    this.emit(this.doctor ? "DOC OK " + this.doctor : "DOC OUT");
+    this.sendRx();
+    for (const b of [1, 2, 3]) { this.emitSlot(b); this.emit(`IR ${b} ${this.ir[b] ? 1 : 0}`); }
+    this.emit(`LCD ${this.lcd[0]}|${this.lcd[1]}`);
+  }
+  boot() {
+    this.q(async () => {
+      this.show("MED DISPENSER", "Self-check..."); this.hello();
+      const steps = [["LCD", "OK found at 0x27"], ["RFID", "OK reader found"], ["KEYPAD", "OK no stuck keys"]];
+      for (const [part, res] of steps) { this.show("Check: " + part.charAt(0) + part.slice(1).toLowerCase(), ""); await this.wait(250); this.emit(`CHECK ${part} ${res}`); }
+      for (const b of [1, 2, 3]) { this.emit(`IR ${b} 0`); this.emit(`CHECK IR${b} OK box ${b} empty`); }
+      for (const b of [1, 2, 3]) { this.show("Check: Servo " + b, ""); await this.wait(250); this.emit(`CHECK SERVO${b} OK moved`); }
+      this.emit("CHECK DONE 0");
+      this.show("Self-check OK", "All parts ready"); await this.ok(); await this.wait(800);
+      this.show("Initialising", "dispenser..."); await this.wait(500);
+      this.idleMsg = "Waiting for Rx"; this.setMode("IDLE");
+    });
+  }
+
+  // ---- PC commands ----
+  command(raw) {
+    this.q(async () => {
+      const cmd = raw.trim(), up = cmd.toUpperCase();
+      if (up === "HELLO") { this.hello(); this.status(); }
+      else if (up === "STATUS") this.status();
+      else if (up === "PING") this.emit("PONG");
+      else if (up === "HISTORY") this.emit("HIST END 0");
+      else if (up === "DOCLOGOUT") { this.doctor = null; this.emit("DOC OUT"); }
+      else if (up.startsWith("DOCLOGIN ")) {
+        const u = this.users.find(x => x.pin === cmd.slice(9).trim());
+        if (u && u.doc) { this.doctor = u.name; this.emit("DOC OK " + u.name); } else this.emit("DOC FAIL");
+      }
+      else if (up.startsWith("RX ")) await this.receiveRx(cmd.slice(3).trim());
+      else if (up.startsWith("SELECT ")) { if (this.mode === "COMPLETE") this.emit("ERR all medicine dispensed - refill or prescribe"); else if (this.mode === "READY") await this.choose(parseInt(up.slice(7), 10)); }
+      else this.emit("ERR unknown command: " + cmd);
+    });
+  }
+  async receiveRx(body) {
+    if (!this.doctor) { this.emit("ERR doctor not logged in"); return; }
+    if (["REFILL", "DISPENSE", "RESET"].includes(this.mode) || this.locked) { this.emit("ERR dispenser busy - try again when the boxes are closed"); return; }
+    const p = body.split("|");
+    if (p.length < 4) { this.emit("ERR bad prescription"); return; }
+    const rx = { patient: p[0].trim(), m: { 1: p[1].trim() || "-", 2: p[2].trim() || "-", 3: p[3].trim() || "-" } };
+    if (![1, 2, 3].some(b => rx.m[b] !== "-")) { this.emit("ERR bad prescription"); return; }
+    this.pending = rx;
+    const needReset = !!this.rx && [1, 2, 3].some(b => this.slots[b].st === "LOADED");
+    if (needReset) { this.emit("NEEDRESET"); this.setMode("RESET_AUTH"); }
+    else { this.activate(); this.setMode("REFILL_AUTH"); }
+  }
+  activate() {
+    if (!this.pending) return;
+    this.rx = this.pending; this.pending = null;
+    for (const b of [1, 2, 3]) { const m = this.rx.m[b]; this.slots[b] = { med: m, pres: m !== "-", st: m !== "-" ? "AWAIT" : "EMPTY" }; }
+    this.sendRx(); for (const b of [1, 2, 3]) this.emitSlot(b);
+  }
+
+  // ---- keypad / card / IR ----
+  key(k) {
+    this.q(async () => {
+      this.emit("KEY " + k);
+      const m = this.mode;
+      if (m === "IDLE") { this.show("No prescription", "Ask the doctor"); await this.wait(1200); this.redraw(); return; }
+      if (["REFILL_AUTH", "REFILL_DONE", "RESET_AUTH", "COMPLETE"].includes(m)) {
+        if (/\d/.test(k)) { if (this.pin.length < 4) { this.pin += k; this.redraw(); } }
+        else if (k === "B") { this.pin = this.pin.slice(0, -1); this.redraw(); }
+        else if (k === "*") { this.pin = ""; this.redraw(); }
+        else if (k === "#") {
+          const code = this.pin; this.pin = "";
+          if (code === this.CODE) {
+            this.emit("CODE OK"); await this.ok();
+            if (m === "REFILL_AUTH") this.setMode("REFILL");
+            else if (m === "RESET_AUTH") this.setMode("RESET");
+            else if (m === "COMPLETE") { for (const b of [1, 2, 3]) { if (this.slots[b].pres) this.slots[b].st = "AWAIT"; this.emitSlot(b); } this.setMode("REFILL"); }
+            else { this.show("Medicine", "Dispenser Ready"); await this.wait(2000); this.setMode("READY"); }
+          } else await this.fail("Wrong code", "CODE");
+        }
+        return;
+      }
+      if (m === "READY") { if ("123".includes(k)) await this.choose(+k); return; }
+      if (m === "AUTH") {
+        this.t.act = Date.now();
+        if (k === "0") { this.show("Exiting...", ""); await this.wait(500); this.setMode("READY"); }
+        else if (/[1-9]/.test(k)) { if (this.pin.length < 4) { this.pin += k; this.redraw(); } }
+        else if (k === "B") { this.pin = this.pin.slice(0, -1); this.redraw(); }
+        else if (k === "*") { this.pin = ""; this.redraw(); }
+        else if (k === "#") {
+          if (this.pin.length === 4) { const pin = this.pin; this.pin = ""; await this.login(this.users.find(u => u.pin === pin), "PIN", "Invalid PIN"); }
+          else { this.show("Enter 4 Digit", "PIN First"); await this.wait(1000); this.redraw(); }
+        }
+      }
+    });
+  }
+  card(uid) {
+    this.q(async () => {
+      if (this.mode !== "AUTH") return;
+      this.emit("CARD " + uid);
+      await this.login(this.users.find(u => u.uid === uid), "CARD", "Unknown Card");
+    });
+  }
+  setIr(b, on) {
+    if (this.ir[b] === on) return;
+    this.ir[b] = on; this.emit(`IR ${b} ${on ? 1 : 0}`);
+  }
+  async choose(b) {
+    const s = this.slots[b];
+    if (!s) return;
+    if (s.st === "LOADED") { this.box = b; this.setMode("AUTH"); return; }
+    const why = !s.pres ? "Not prescribed" : s.st === "DISPENSED" ? "Already given" : "Empty";
+    this.emit(`ERR box ${b}: ${why}`); this.show("Box " + b, why); await this.no(); await this.wait(1200); this.redraw();
+  }
+  async login(u, method, failText) {
+    if (!u) { await this.fail(failText, method); return; }
+    this.emit(`AUTH ${method} ${u.name}`); this.show("Welcome!", u.name); await this.ok(); await this.wait(1000);
+    if (this.box <= u.level) { this.setMode("DISPENSE"); return; }
+    this.emit(`DENIED ${this.box} ${u.name}`); this.show("Access Denied", "Not Authorised"); await this.no(); await this.wait(1500);
+    this.t.act = Date.now(); this.redraw();
+  }
+  async fail(text, method) {
+    this.attempts++;
+    this.emit(`FAIL ${method} ${this.attempts} ${this.MAX}`); this.show(text, "Access Denied"); await this.no(); await this.wait(1200);
+    if (this.attempts >= this.MAX) {
+      this.locked = true; this.emit("LOCK " + this.LOCK);
+      for (let s = this.LOCK; s > 0; s--) { this.show("Too Many Tries", `Wait ${s} s`); await this.wait(1000); } this.attempts = 0; this.locked = false; this.emit("UNLOCK");
+    }
+    this.pin = ""; this.t.act = Date.now(); this.redraw();
+  }
+
+  // ---- timed phases ----
+  nextRefill() {
+    const b = this.queue.shift();
+    if (!b) { this.box = 0; this.emit("REFILLED"); this.setMode("REFILL_DONE"); return; }
+    this.box = b; this.t.det = 0; this.slot(b, "AWAIT"); this.emit("REFILL " + b); this.servo(b, true); this.redraw();
+  }
+  async update() {
+    const now = Date.now(), m = this.mode;
+    if (m === "REFILL" && this.box) {
+      const b = this.box;
+      if (!this.ir[b]) { if (this.t.det) { this.t.det = 0; this.redraw(); } return; }
+      if (!this.t.det) this.t.det = now;
+      const el = now - this.t.det;
+      if (el >= this.CLOSE) { this.servo(b, false); this.slot(b, "LOADED"); this.emit("LOADED " + b); await this.wait(600); this.nextRefill(); }
+      else this.show(`Box ${b} detected`, `Closing in ${Math.ceil((this.CLOSE - el) / 1000)} s`);
+    }
+    else if (m === "DISPENSE") {
+      const b = this.box;
+      if (!this.ir[b]) {
+        if (!this.t.taken) this.t.taken = now;
+        const el = now - this.t.taken;
+        if (el >= this.CLOSE) { this.servo(b, false); await this.finishDispense(true); }
+        else this.show("Medicine taken", `Closing in ${Math.ceil((this.CLOSE - el) / 1000)} s`);
+        return;
+      }
+      if (this.t.taken) this.t.taken = 0;
+      if (now - this.t.open >= this.COLLECT) { this.servo(b, false); await this.finishDispense(false); return; }
+      this.show(`Take med: ${Math.ceil((this.COLLECT - (now - this.t.open)) / 1000)} s`, this.slots[b].med);
+    }
+    else if (m === "RESET") {
+      const left = [1, 2, 3].filter(b => this.ir[b]);
+      if (left.length) { this.t.empty = 0; this.show("RESET: empty box", "Remove: " + left.join(" ")); return; }
+      if (!this.t.empty) this.t.empty = now;
+      if (now - this.t.empty >= this.EMPTY) await this.finishReset();
+      else this.show("All boxes empty", "Checking...");
+    }
+    else if (m === "AUTH" && now - this.t.act > this.LOGIN) {
+      this.emit("TIMEOUT"); this.show("Session Timeout", "Start Again"); await this.no(); await this.wait(1000); this.setMode("READY");
+    }
+  }
+  async finishDispense(taken) {
+    const b = this.box, s = this.slots[b];
+    if (taken) { this.slot(b, "DISPENSED"); this.emit(`DISPENSED ${b} ${s.med}`); this.show("Dispensed", s.med); }
+    else { this.emit("NOTTAKEN " + b); this.show("Not collected", `Box ${b} closed`); await this.no(); }
+    await this.wait(1500);
+    const pres = [1, 2, 3].filter(x => this.slots[x].pres);
+    if (pres.length && pres.every(x => this.slots[x].st === "DISPENSED")) {
+      this.emit("RXCOMPLETE " + this.rx.patient); this.setMode("COMPLETE");
+    } else this.setMode("READY");
+  }
+  async finishReset() {
+    for (const b of [1, 2, 3]) this.servo(b, false);
+    for (const b of [1, 2, 3]) this.slots[b] = { med: "-", pres: false, st: "EMPTY" };
+    this.rx = null;
+    this.emit("EMPTIED"); this.show("Emptied", ""); await this.wait(2000);
+    if (this.pending) { this.activate(); this.setMode("REFILL_AUTH"); }
+    else { this.sendRx(); for (const b of [1, 2, 3]) this.emitSlot(b); this.idleMsg = "Waiting for Rx"; this.setMode("IDLE"); }
+  }
+}
+
+/* demo controls */
+(function buildDemo() {
+  const keys = ["1","2","3","A","4","5","6","B","7","8","9","C","*","0","#","D"];
+  $("demoKeypad").innerHTML = keys.map(k => `<button type="button" data-k="${k}">${k}</button>`).join("");
+  $("demoKeypad").onclick = e => { const k = e.target.dataset && e.target.dataset.k; if (k && sim) sim.key(k); };
+  const cards = [["Patient card", "9DB9BE21"], ["Head Nurse card", "F3A0EEE3"], ["Doctor card", "CFDE401C"], ["Unknown card", "DEADBEEF"]];
+  $("demoCards").innerHTML = cards.map(([l, u]) => `<button type="button" class="btn small" data-uid="${u}">${l}</button>`).join("");
+  $("demoCards").onclick = e => {
+    const u = e.target.dataset && e.target.dataset.uid;
+    if (!u || !sim) return;
+    if (S.mode !== "AUTH") { toast("Choose a box on the keypad first - the reader is only active on the login screen"); return; }
+    sim.card(u);
+  };
+  $("demoIr").onclick = e => { const b = e.target.dataset && e.target.dataset.ir; if (b && sim) sim.setIr(+b, !sim.ir[+b]); };
+})();
+function renderDemoIr() {
+  if (S.conn !== "demo") return;
+  patch($("demoIr"), [1, 2, 3].map(b => `<button type="button" class="btn small irbtn ${S.ir[b] ? "on" : ""}" data-ir="${b}">Box ${b}: ${S.ir[b] ? "take medicine out" : "put medicine in"}</button>`).join(""));
+}
+
+/* =====================================================================
+   8. BUTTONS
+   ===================================================================== */
+$("btnConnect").onclick = () => connectSerial(false);
+$("btnDemo").onclick = startDemo;
+$("btnDisconnect").onclick = disconnect;
+$("btnLogout").onclick = () => send("DOCLOGOUT");
+$("btnExport").onclick = exportCSV;
+$("btnClearLog").onclick = () => { store.activity = []; save(); renderActivity(); };
+function sendRaw() { const v = $("cmdInput").value.trim(); if (v) { $("cmdInput").value = ""; send(v); } }
+$("btnSendCmd").onclick = sendRaw;
+$("cmdInput").onkeydown = e => { if (e.key === "Enter") sendRaw(); };
+if (!("serial" in navigator)) banner("warn", "To connect to the real dispenser, open this file in <b>Google Chrome</b> or <b>Microsoft Edge</b> on a computer. Demo mode works in any browser.");
+
+renderActivity();
+render();
+</script>
+</body>
+</html>
