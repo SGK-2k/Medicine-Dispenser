@@ -8,9 +8,13 @@
 //
 // Keys:
 //   1-3  select box (on the selection screen)
-//   0-9  PIN digits (on the login screen)
+//   1-9  PIN digits (on the login screen)
 //   #    submit PIN
-//   *    clear PIN; press again on an empty PIN to go back
+//   *    clear PIN
+//   0    exit to box selection (so PINs must not contain 0)
+//
+// A wrong PIN / unknown card keeps you on the login screen.
+// After 3 wrong tries the keypad locks for 10 seconds, then you can retry.
 //
 // Board package: "Raspberry Pi Pico/RP2040" by Earle Philhower
 // Libraries: MFRC522 (GithubCommunity), LiquidCrystal I2C (Frank de Brabander)
@@ -54,16 +58,22 @@
 #define BUZZER        22
 #define BUZZER_ENABLED 1
 
-// Servo positions
+// Servo positions (degrees)
 #define SERVO_CLOSED  0
-#define SERVO_OPEN    90
+#define SERVO_OPEN    180
+
+// Pulse range for a full 0-180 sweep on SG90 / MG90S / MG996R servos.
+// If your servo buzzes or strains at the ends, try 600 and 2400.
+#define SERVO_MIN_US  500
+#define SERVO_MAX_US  2500
 
 // ======================================================
 // 2. SETTINGS
 // ======================================================
 
 const unsigned long LOGIN_TIMEOUT = 30000;  // ms of inactivity before reset
-const int           MAX_ATTEMPTS  = 3;      // wrong PIN/card tries per box
+const int           MAX_ATTEMPTS  = 3;      // wrong tries before a lockout
+const unsigned long LOCKOUT_TIME  = 10000;  // ms the keypad is locked
 const unsigned long BOX_OPEN_TIME = 3000;   // ms the box stays open
 
 // ======================================================
@@ -194,15 +204,20 @@ char getKey()
 // 6. SERVOS
 // ======================================================
 
-Servo generalServo;
-Servo severeServo;
-Servo highServo;
+Servo generalServo;   // Box 1 - General medicine
+Servo severeServo;    // Box 2 - Severe medicine
+Servo highServo;      // Box 3 - High severity medicine
 
+// Returns the servo for the selected box, or nullptr if the box number is invalid
 Servo* boxServo(int box)
 {
-    if (box == 1) return &generalServo;
-    if (box == 2) return &severeServo;
-    return &highServo;
+    switch (box)
+    {
+        case 1:  return &generalServo;   // Box 1 - General
+        case 2:  return &severeServo;    // Box 2 - Severe
+        case 3:  return &highServo;      // Box 3 - High severity
+        default: return nullptr;         // anything else - no box
+    }
 }
 
 // ======================================================
@@ -297,7 +312,7 @@ void showLoginScreen()
 
     if (enteredPIN.length() == 0)
     {
-        showLCD(line1, "Card or PIN+#");
+        showLCD(line1, "Card/PIN# 0=Exit");
     }
     else
     {
@@ -340,7 +355,7 @@ void goToAuthenticate(int box)
     Serial.print(" (");
     Serial.print(boxNames[box]);
     Serial.println(")");
-    Serial.println("Scan RFID card or enter PIN followed by #.");
+    Serial.println("Scan RFID card or enter PIN followed by #. Press 0 to exit.");
 }
 
 // ======================================================
@@ -349,6 +364,19 @@ void goToAuthenticate(int box)
 
 void openBox(int box)
 {
+    Servo* s = boxServo(box);
+
+    if (s == nullptr)
+    {
+        Serial.print("ERROR: invalid box number ");
+        Serial.println(box);
+        showLCD("Invalid Box", "Start Again");
+        deniedSignal();
+        delay(1500);
+        goToSelectBox();
+        return;
+    }
+
     Serial.print("ACCESS GRANTED - opening box ");
     Serial.println(box);
 
@@ -357,7 +385,6 @@ void openBox(int box)
     showLCD("Access Granted", "Opening Box " + String(box));
     beep(1800, 200);
 
-    Servo* s = boxServo(box);
     s->write(SERVO_OPEN);
     delay(BOX_OPEN_TIME);
     s->write(SERVO_CLOSED);
@@ -394,7 +421,10 @@ void handleUser(int role)
         deniedSignal();
         delay(1500);
 
-        goToSelectBox();
+        // Stay on the login screen so another user can log in
+        enteredPIN   = "";
+        lastActivity = millis();
+        showLoginScreen();
     }
 }
 
@@ -416,13 +446,20 @@ void handleFailedAttempt(String line1)
 
     if (attempts >= MAX_ATTEMPTS)
     {
-        Serial.println("Too many failed attempts.");
-        showLCD("Too Many Tries", "Start Again");
-        delay(1500);
-        goToSelectBox();
-        return;
+        Serial.println("Too many failed attempts - keypad locked.");
+        digitalWrite(RED_LED, HIGH);
+
+        for (int s = LOCKOUT_TIME / 1000; s > 0; s--)
+        {
+            showLCD("Too Many Tries", "Wait " + String(s) + " s");
+            delay(1000);
+        }
+
+        digitalWrite(RED_LED, LOW);
+        attempts = 0;
     }
 
+    // Stay on the login screen for the SAME box
     enteredPIN   = "";
     lastActivity = millis();
     showLoginScreen();
@@ -502,7 +539,15 @@ void handleKeyAuth(char key)
 {
     lastActivity = millis();
 
-    if (key >= '0' && key <= '9')
+    if (key == '0')
+    {
+        keyClick();
+        Serial.println("Exit pressed.");
+        showLCD("Exiting...", "");
+        delay(500);
+        goToSelectBox();
+    }
+    else if (key >= '1' && key <= '9')
     {
         if (enteredPIN.length() < 4)
         {
@@ -528,17 +573,9 @@ void handleKeyAuth(char key)
     else if (key == '*')
     {
         keyClick();
-        if (enteredPIN.length() > 0)
-        {
-            enteredPIN = "";
-            Serial.println("PIN cleared.");
-            showLoginScreen();
-        }
-        else
-        {
-            Serial.println("Cancelled.");
-            goToSelectBox();
-        }
+        enteredPIN = "";
+        Serial.println("PIN cleared.");
+        showLoginScreen();
     }
     // A, B, C, D are ignored
 }
@@ -580,9 +617,9 @@ void setup()
     rfid.PCD_Init();
 
     // Servos
-    generalServo.attach(SERVO_GENERAL);
-    severeServo.attach(SERVO_SEVERE);
-    highServo.attach(SERVO_HIGH);
+    generalServo.attach(SERVO_GENERAL, SERVO_MIN_US, SERVO_MAX_US);
+    severeServo.attach(SERVO_SEVERE, SERVO_MIN_US, SERVO_MAX_US);
+    highServo.attach(SERVO_HIGH, SERVO_MIN_US, SERVO_MAX_US);
     generalServo.write(SERVO_CLOSED);
     severeServo.write(SERVO_CLOSED);
     highServo.write(SERVO_CLOSED);
