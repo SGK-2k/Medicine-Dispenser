@@ -1,0 +1,4114 @@
+/**
+ * @file MediDispense_Firmware_FileReference.dox
+ * @brief Complete Arduino firmware for the MediDispense medicine dispenser.
+ *
+ * @details
+ * This firmware controls the complete embedded medicine-dispenser workflow:
+ * keypad input, MFRC522 RFID authentication, I2C LCD output, three servo-driven
+ * medicine boxes, three IR presence sensors, access control, prescription
+ * storage, refill/reset sequences, dispensing, access history, and the USB
+ * serial protocol used by the doctor GUI.
+ *
+ * The software is organized using object-oriented abstractions, linked
+ * data structures, an event bus, authentication strategies, and a state
+ * pattern for the dispenser workflow.
+ *
+ * @author P I SAI MATHESH
+ * @author S GOPALAKRISHNAN
+ * @version 5
+ * @date 2026
+ */
+#include <Wire.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Servo.h>
+#include <LiquidCrystal_I2C.h>
+
+#define FIRMWARE_VERSION "5"
+
+// ======================================================
+// 1. PIN DEFINITIONS
+// ======================================================
+// WIRING SUMMARY (Pico W GP number -> physical pin)
+//   Keypad rows R1-R4    GP0, GP1, GP2, GP3      (pins 1, 2, 4, 5)
+//   Keypad cols C1-C4    GP12, GP13, GP14, GP15  (pins 16, 17, 19, 20)
+//   RFID  MISO/SDA/SCK/MOSI  GP4, GP5, GP6, GP7  (pins 6, 7, 9, 10)
+//   RFID  RST            GP28                    (pin 34)   RFID VCC = 3V3 only
+//   LCD   SDA / SCL      GP8, GP9                (pins 11, 12)
+//   Servo 1 / 2 / 3      GP16, GP17, GP18        (pins 21, 22, 24)
+//   IR    1 / 2 / 3      GP19, GP20, GP21        (pins 25, 26, 27)
+
+// RFID - SPI0
+#define RFID_MISO     4
+#define RFID_SS       5
+#define RFID_SCK      6
+#define RFID_MOSI     7
+#define RFID_RST      28
+
+// LCD - I2C0
+#define LCD_SDA       8
+#define LCD_SCL       9
+#define LCD_ADDRESS   0x27      // change to 0x3F if your LCD uses it
+
+// IR sensors (one per box)
+#define IR_BOX1       19
+#define IR_BOX2       20
+#define IR_BOX3       21
+#define IR_ACTIVE_LOW 0        // 1 = output goes LOW when something is detected
+                                //     (FC-51 style modules). Set 0 if yours goes HIGH.
+
+// Servos
+#define SERVO_GENERAL 16
+#define SERVO_SEVERE  17
+#define SERVO_HIGH    18
+
+// Servo positions (degrees) and pulse range for a full 0-180 sweep
+#define SERVO_CLOSED  0
+#define SERVO_OPEN    180
+#define SERVO_MIN_US  500
+#define SERVO_MAX_US  2500
+
+// ======================================================
+// 2. SETTINGS
+// ======================================================
+
+const char*         REFILL_CODE      = "1234";  // refill / reset passcode
+const unsigned long CLOSE_DELAY      = 5000;    // ms after IR change before a box closes
+const unsigned long COLLECT_TIMEOUT  = 30000;   // ms to take the medicine
+const unsigned long EMPTY_CONFIRM    = 3000;    // ms all boxes must read empty in reset
+const unsigned long LOGIN_TIMEOUT    = 30000;   // ms of inactivity on the login screen
+const unsigned long DOCTOR_SESSION   = 900000;  // 15 min doctor session on the GUI
+const int           MAX_ATTEMPTS     = 3;       // wrong tries before a lockout
+const unsigned long LOCKOUT_TIME     = 10000;   // ms locked after too many tries
+const unsigned long IR_DEBOUNCE      = 80;      // ms an IR reading must be stable
+const uint8_t       PIN_LENGTH       = 4;
+const size_t        HISTORY_SIZE     = 20;
+const size_t        QUEUE_SIZE       = 16;
+const int           BOX_COUNT        = 3;
+
+const char* const BOX_NAMES[] = { "", "General", "Severe", "High Sev" };
+
+// ------------------------------------------------------
+// USER TABLE - one row per user.
+// level       = highest box the user may open (1 General, 2 Severe, 3 High)
+// canPrescribe = may log in on the GUI and send prescriptions
+// ------------------------------------------------------
+/**
+ * @brief Compile-time configuration record describing an authorized dispenser user.
+ */
+struct UserConfig
+{
+    const char* name;
+    const char* pin;
+    const char* uid;
+    int         level;
+    bool        canPrescribe;
+};
+
+const UserConfig USER_TABLE[] =
+{
+    { "Patient",    "1111", "9DB9BE21", 1, false },
+    { "Head Nurse", "3333", "F3A0EEE3", 2, false },
+    { "Doctor",     "4444", "CFDE401C", 3, true  }
+};
+
+const int USER_TABLE_SIZE = sizeof(USER_TABLE) / sizeof(USER_TABLE[0]);
+
+
+// ######################################################
+//                  DATA STRUCTURES
+// ######################################################
+
+// ======================================================
+// 3. STACK - code digits (linked nodes on the heap)
+// ======================================================
+/**
+ * @brief Bounded linked-list stack used to collect PIN or refill-code digits.
+ */
+class PinStack
+{
+public:
+    /**
+     * @brief Performs the in stack operation.
+     *
+     * @param capacity Input/output parameter used by this operation.
+     *
+     * @return Result produced by the in stack operation.
+     */
+    explicit PinStack(uint8_t capacity) : capacity_(capacity) {}
+    /**
+     * @brief Performs the pin stack operation.
+     *
+     * @return Result produced by the pin stack operation.
+     */
+    ~PinStack() { clear(); }
+
+    bool push(char digit)
+    {
+        if (size_ >= capacity_) return false;
+        top_ = new Node{ digit, top_ };
+        size_++;
+        return true;
+    }
+
+    bool pop(char* out = nullptr)
+    {
+        if (top_ == nullptr) return false;
+        Node* node = top_;
+        if (out != nullptr) *out = node->digit;
+        top_ = node->next;
+        delete node;
+        size_--;
+        return true;
+    }
+
+    /**
+     * @brief Removes all stored items and resets the structure to an empty state.
+     */
+    void clear() { while (pop()) { } }
+
+    /**
+     * @brief Returns the current number of stored items.
+     *
+     * @return Result produced by the size operation.
+     */
+    uint8_t size()  const { return size_; }
+    /**
+     * @brief Checks whether the structure has reached its configured capacity.
+     *
+     * @return Result produced by the full operation.
+     */
+    bool    full()  const { return size_ >= capacity_; }
+    /**
+     * @brief Checks whether the structure currently contains no items.
+     *
+     * @return Result produced by the empty operation.
+     */
+    bool    empty() const { return size_ == 0; }
+
+    // Digits in typing order (bottom of the stack first)
+    String toString() const
+    {
+        char buf[17];
+        uint8_t i = size_;
+        buf[i] = '\0';
+        for (Node* n = top_; n != nullptr; n = n->next) buf[--i] = n->digit;
+        /**
+         * @brief Performs the string operation.
+         *
+         * @param buf Input/output parameter used by this operation.
+         *
+         * @return Result produced by the string operation.
+         */
+        return String(buf);
+    }
+
+private:
+    /**
+     * @brief Defines the Node struct used by the dispenser firmware.
+     */
+    struct Node { char digit; Node* next; };
+
+    Node*         top_  = nullptr;
+    uint8_t       size_ = 0;
+    const uint8_t capacity_;
+};
+
+// ======================================================
+// 4. QUEUE - generic FIFO (singly linked list)
+// ======================================================
+template <typename T>
+/**
+ * @brief Generic bounded FIFO queue implemented using a singly linked list.
+ */
+class Queue
+{
+public:
+    /**
+     * @brief Performs the ueue operation.
+     *
+     * @param capacity Input/output parameter used by this operation.
+     *
+     * @return Result produced by the ueue operation.
+     */
+    explicit Queue(size_t capacity) : capacity_(capacity) {}
+    /**
+     * @brief Performs the queue operation.
+     *
+     * @return Result produced by the queue operation.
+     */
+    ~Queue() { clear(); }
+
+    bool push(const T& value)
+    {
+        if (size_ >= capacity_) return false;
+        Node* node = new Node{ value, nullptr };
+        if (tail_ != nullptr) tail_->next = node;
+        else                  head_ = node;
+        tail_ = node;
+        size_++;
+        return true;
+    }
+
+    bool pop(T& out)
+    {
+        if (head_ == nullptr) return false;
+        Node* node = head_;
+        out   = node->value;
+        head_ = node->next;
+        if (head_ == nullptr) tail_ = nullptr;
+        delete node;
+        size_--;
+        return true;
+    }
+
+    void clear()
+    {
+        T discard;
+        /**
+         * @brief Performs the hile operation.
+         *
+         * @param discard Input/output parameter used by this operation.
+         *
+         * @return Result produced by the hile operation.
+         */
+        while (pop(discard)) { }
+    }
+
+    /**
+     * @brief Checks whether the structure currently contains no items.
+     *
+     * @return Result produced by the empty operation.
+     */
+    bool   empty() const { return size_ == 0; }
+    /**
+     * @brief Returns the current number of stored items.
+     *
+     * @return Result produced by the size operation.
+     */
+    size_t size()  const { return size_; }
+
+private:
+    /**
+     * @brief Defines the Node struct used by the dispenser firmware.
+     */
+    struct Node { T value; Node* next; };
+
+    Node*        head_ = nullptr;
+    Node*        tail_ = nullptr;
+    size_t       size_ = 0;
+    const size_t capacity_;
+};
+
+// ======================================================
+// 5. INPUT EVENT - what goes through the input queue
+// ======================================================
+/**
+ * @brief Identifies the source or meaning of an input event.
+ */
+enum class InputType : uint8_t
+{
+    Key, Card,                                  // from the dispenser
+    SelectBox, Pin, Clear, Exit,                // optional, from the PC
+    Hello, Status, Ping, History,               // info requests
+    DocLogin, DocLogout, Prescription,          // doctor actions
+    Unknown
+};
+
+/**
+ * @brief Represents one normalized input event consumed by the dispenser controller.
+ */
+struct InputEvent
+{
+    InputType type = InputType::Unknown;
+    char      key  = 0;
+    int       box  = 0;
+    String    text = "";
+};
+
+// ======================================================
+// 6. USERS - singly linked list, created by a factory
+// ======================================================
+/**
+ * @brief Runtime linked-list node containing one authorized user's credentials and access level.
+ */
+struct User
+{
+    String name;
+    String pin;
+    String uid;
+    int    level;
+    bool   canPrescribe;
+    User*  next;
+};
+
+/**
+ * @brief Factory responsible for constructing runtime User objects from configuration records.
+ */
+class UserFactory
+{
+public:
+    static User* create(const UserConfig& cfg)
+    {
+        return new User{ cfg.name, cfg.pin, cfg.uid, cfg.level, cfg.canPrescribe, nullptr };
+    }
+};
+
+/**
+ * @brief Owns and searches the linked list of authorized users.
+ */
+class UserRegistry
+{
+public:
+    ~UserRegistry()
+    {
+        while (head_ != nullptr)
+        {
+            User* next = head_->next;
+            delete head_;
+            head_ = next;
+        }
+    }
+
+    void add(User* user)
+    {
+        if (user == nullptr) return;
+        user->next = nullptr;
+        /**
+         * @brief Performs the f operation.
+         *
+         * @param head_ Input/output parameter used by this operation.
+         *
+         * @return Result produced by the f operation.
+         */
+        if (head_ == nullptr) { head_ = user; }
+        else
+        {
+            User* cur = head_;
+            while (cur->next != nullptr) cur = cur->next;
+            cur->next = user;
+        }
+        count_++;
+    }
+
+    User* findByPin(const String& pin) const
+    {
+        for (User* u = head_; u != nullptr; u = u->next) if (u->pin == pin) return u;
+        return nullptr;
+    }
+
+    User* findByUid(const String& uid) const
+    {
+        for (User* u = head_; u != nullptr; u = u->next) if (u->uid == uid) return u;
+        return nullptr;
+    }
+
+    /**
+     * @brief Performs the first operation.
+     *
+     * @return Result produced by the first operation.
+     */
+    User* first() const { return head_; }
+    /**
+     * @brief Performs the count operation.
+     *
+     * @return Result produced by the count operation.
+     */
+    int   count() const { return count_; }
+
+private:
+    User* head_  = nullptr;
+    int   count_ = 0;
+};
+
+// ======================================================
+// 7. ACCESS HISTORY - doubly linked list, newest at the tail
+// ======================================================
+/**
+ * @brief Stores one access-control or dispenser-history event.
+ */
+struct AccessRecord
+{
+    unsigned long timeMs;
+    int           box;
+    String        who;
+    String        method;
+    String        result;   // OPENED, DENIED, FAILED, LOCKED, TIMEOUT, DISPENSED,
+                            // NOTTAKEN, LOADED, EMPTIED
+    AccessRecord* prev;
+    AccessRecord* next;
+};
+
+/**
+ * @brief Bounded history collection containing recent access records.
+ */
+class AccessHistory
+{
+public:
+    /**
+     * @brief Performs the ccess history operation.
+     *
+     * @param capacity Input/output parameter used by this operation.
+     *
+     * @return Result produced by the ccess history operation.
+     */
+    explicit AccessHistory(size_t capacity) : capacity_(capacity) {}
+    /**
+     * @brief Performs the access history operation.
+     *
+     * @return Result produced by the access history operation.
+     */
+    ~AccessHistory() { while (head_ != nullptr) removeOldest(); }
+
+    void add(int box, const String& who, const String& method, const String& result)
+    {
+        AccessRecord* rec = new AccessRecord{ millis(), box, who, method, result, tail_, nullptr };
+        if (tail_ != nullptr) tail_->next = rec;
+        else                  head_ = rec;
+        tail_ = rec;
+        size_++;
+        /**
+         * @brief Performs the f operation.
+         *
+         * @param removeOldest Input/output parameter used by this operation.
+         *
+         * @return Result produced by the f operation.
+         */
+        if (size_ > capacity_) removeOldest();
+    }
+
+    template <typename Visitor>
+    void forEachNewestFirst(Visitor visit) const
+    {
+        for (AccessRecord* r = tail_; r != nullptr; r = r->prev) visit(*r);
+    }
+
+    /**
+     * @brief Returns the current number of stored items.
+     *
+     * @return Result produced by the size operation.
+     */
+    size_t size() const { return size_; }
+
+private:
+    void removeOldest()
+    {
+        if (head_ == nullptr) return;
+        AccessRecord* old = head_;
+        head_ = old->next;
+        if (head_ != nullptr) head_->prev = nullptr;
+        else                  tail_ = nullptr;
+        delete old;
+        size_--;
+    }
+
+    AccessRecord* head_ = nullptr;
+    AccessRecord* tail_ = nullptr;
+    size_t        size_ = 0;
+    const size_t  capacity_;
+};
+
+// ======================================================
+// 8. PRESCRIPTION AND BOX SLOTS
+// ======================================================
+/**
+ * @brief Enumerates the logical state of a medicine box slot.
+ */
+enum class SlotStatus : uint8_t { Empty, Await, Loaded, Dispensed };
+
+/**
+ * @brief Stores prescription and occupancy state for one medicine box.
+ */
+struct BoxSlot
+{
+    int        box        = 0;
+    String     medicine   = "-";
+    bool       prescribed = false;
+    SlotStatus status     = SlotStatus::Empty;
+
+    const char* statusName() const
+    {
+        switch (status)
+        {
+            case SlotStatus::Await:     return "AWAIT";
+            case SlotStatus::Loaded:    return "LOADED";
+            case SlotStatus::Dispensed: return "DISPENSED";
+            default:                    return "EMPTY";
+        }
+    }
+};
+
+/**
+ * @brief Stores a patient name and the medicine assigned to each box.
+ */
+struct Prescription
+{
+    String patient = "";
+    String medicine[BOX_COUNT + 1];          // index 1..3, "-" = none
+    bool   active  = false;
+
+    /**
+     * @brief Performs the has box operation for SlotStatus.
+     *
+     * @param box Input/output parameter used by this operation.
+     *
+     * @return Result produced by the has box operation.
+     */
+    bool hasBox(int box) const { return medicine[box].length() > 0 && medicine[box] != "-"; }
+};
+
+
+// ######################################################
+//              OBSERVER: EVENTS FOR THE GUI
+// ######################################################
+
+/**
+ * @brief Interface implemented by objects that consume published dispenser events.
+ */
+class EventListener
+{
+public:
+    /**
+     * @brief Performs the event listener operation for SlotStatus.
+     *
+     * @return Result produced by the event listener operation.
+     */
+    virtual ~EventListener() {}
+    virtual void onEvent(const String& event) = 0;
+};
+
+/**
+ * @brief Simple publish/subscribe event dispatcher used by the firmware.
+ */
+class EventBus
+{
+public:
+    ~EventBus()
+    {
+        while (head_ != nullptr)
+        {
+            Node* next = head_->next;
+            delete head_;
+            head_ = next;
+        }
+    }
+
+    /**
+     * @brief Registers an event listener with the event bus.
+     *
+     * @param listener Input/output parameter used by this operation.
+     */
+    void subscribe(EventListener* listener) { head_ = new Node{ listener, head_ }; }
+
+    void publish(const String& event) const
+    {
+        for (Node* n = head_; n != nullptr; n = n->next) n->listener->onEvent(event);
+    }
+
+private:
+    /**
+     * @brief Defines the Node struct used by the dispenser firmware.
+     */
+    struct Node { EventListener* listener; Node* next; };
+    Node* head_ = nullptr;
+};
+
+/**
+ * @brief Event listener that forwards dispenser events to USB Serial.
+ */
+class SerialReporter : public EventListener
+{
+public:
+    void onEvent(const String& event) override
+    {
+        Serial.print("EVT ");
+        Serial.println(event);
+    }
+};
+
+
+// ######################################################
+//              DEVICES (inheritance from Device)
+// ######################################################
+
+/**
+ * @brief Abstract base class for hardware devices managed by the dispenser.
+ */
+class Device
+{
+public:
+    /**
+     * @brief Performs the evice operation for SlotStatus.
+     *
+     * @param name Input/output parameter used by this operation.
+     * @param name Input/output parameter used by this operation.
+     * @param bus Input/output parameter used by this operation.
+     *
+     * @return Result produced by the evice operation.
+     */
+    Device(const char* name, EventBus* bus) : name_(name), bus_(bus) {}
+    /**
+     * @brief Performs the device operation for SlotStatus.
+     *
+     * @return Result produced by the device operation.
+     */
+    virtual ~Device() {}
+    virtual void begin() = 0;
+    /**
+     * @brief Performs the name operation for SlotStatus.
+     *
+     * @return Result produced by the name operation.
+     */
+    const char* name() const { return name_; }
+
+protected:
+    /**
+     * @brief Publishes an event to all registered listeners.
+     *
+     * @param event Input/output parameter used by this operation.
+     */
+    void publish(const String& event) const { if (bus_ != nullptr) bus_->publish(event); }
+
+    const char* name_;
+    EventBus*   bus_;
+};
+
+// ---------- Box servo ----------
+/**
+ * @brief Controls one medicine-box servo and tracks whether the box is open.
+ */
+class BoxServo : public Device
+{
+public:
+    BoxServo(const char* name, uint8_t pin, int box, EventBus* bus)
+        : Device(name, bus), pin_(pin), box_(box) {}
+
+    void begin() override
+    {
+        servo_.attach(pin_, SERVO_MIN_US, SERVO_MAX_US);
+        servo_.write(SERVO_CLOSED);
+    }
+
+    void open()
+    {
+        servo_.write(SERVO_OPEN);
+        open_ = true;
+        /**
+         * @brief Performs the ublish operation for SlotStatus.
+         *
+         * @param box_ Input/output parameter used by this operation.
+         *
+         * @return Result produced by the ublish operation.
+         */
+        publish("OPEN " + String(box_));
+    }
+
+    void close()
+    {
+        servo_.write(SERVO_CLOSED);
+        open_ = false;
+        /**
+         * @brief Performs the ublish operation for SlotStatus.
+         *
+         * @param box_ Input/output parameter used by this operation.
+         *
+         * @return Result produced by the ublish operation.
+         */
+        publish("CLOSE " + String(box_));
+    }
+
+    // Small movement used by the start-up self-check
+    void wiggle()
+    {
+        servo_.write(45);
+        /**
+         * @brief Performs the elay operation for SlotStatus.
+         *
+         * @return Result produced by the elay operation.
+         */
+        delay(350);
+        servo_.write(SERVO_CLOSED);
+        /**
+         * @brief Performs the elay operation for SlotStatus.
+         *
+         * @return Result produced by the elay operation.
+         */
+        delay(350);
+    }
+
+    /**
+     * @brief Returns whether the medicine box is currently commanded open.
+     *
+     * @return Result produced by the is open operation.
+     */
+    bool isOpen() const { return open_; }
+    /**
+     * @brief Returns the medicine-box number associated with this object.
+     *
+     * @return Result produced by the box operation.
+     */
+    int  box()    const { return box_; }
+
+private:
+    Servo   servo_;
+    uint8_t pin_;
+    int     box_;
+    bool    open_ = false;
+};
+
+// ---------- IR sensor (one per box) ----------
+/**
+ * @brief Debounced digital medicine-presence sensor for one box.
+ */
+class IrSensor : public Device
+{
+public:
+    IrSensor(const char* name, uint8_t pin, int box, EventBus* bus)
+        : Device(name, bus), pin_(pin), box_(box) {}
+
+    void begin() override
+    {
+        /**
+         * @brief Performs the in mode operation for SlotStatus.
+         *
+         * @param pin_ Input/output parameter used by this operation.
+         * @param INPUT_PULLUP Input/output parameter used by this operation.
+         *
+         * @return Result produced by the in mode operation.
+         */
+        pinMode(pin_, INPUT_PULLUP);
+        stable_ = readRaw();
+        candidate_ = stable_;
+    }
+
+    bool readRaw() const
+    {
+        bool level = digitalRead(pin_) == HIGH;
+        return IR_ACTIVE_LOW ? !level : level;
+    }
+
+    // Debounce: a new reading must stay the same for IR_DEBOUNCE ms
+    void update()
+    {
+        bool raw = readRaw();
+        unsigned long now = millis();
+
+        if (raw != candidate_)
+        {
+            candidate_ = raw;
+            changedAt_ = now;
+        }
+        else if (raw != stable_ && now - changedAt_ >= IR_DEBOUNCE)
+        {
+            stable_ = raw;
+            /**
+             * @brief Performs the ublish operation for SlotStatus.
+             *
+             * @param stable_ Input/output parameter used by this operation.
+             *
+             * @return Result produced by the ublish operation.
+             */
+            publish("IR " + String(box_) + (stable_ ? " 1" : " 0"));
+        }
+    }
+
+    /**
+     * @brief Returns whether the IR sensor currently detects medicine.
+     *
+     * @return Result produced by the present operation.
+     */
+    bool present() const { return stable_; }   // true = medicine detected
+    /**
+     * @brief Returns the medicine-box number associated with this object.
+     *
+     * @return Result produced by the box operation.
+     */
+    int  box()     const { return box_; }
+
+private:
+    uint8_t       pin_;
+    int           box_;
+    bool          stable_    = false;
+    bool          candidate_ = false;
+    unsigned long changedAt_ = 0;
+};
+
+// ---------- LCD ----------
+/**
+ * @brief Wrapper for the 16x2 I2C LCD with event mirroring to the GUI.
+ */
+class LcdDisplay : public Device
+{
+public:
+    LcdDisplay(const char* name, uint8_t address, EventBus* bus)
+        : Device(name, bus), address_(address), lcd_(address, 16, 2) {}
+
+    void begin() override
+    {
+        Wire.setSDA(LCD_SDA);
+        Wire.setSCL(LCD_SCL);
+        Wire.begin();
+        lcd_.init();
+        lcd_.backlight();
+    }
+
+    bool detected() const
+    {
+        Wire.beginTransmission(address_);
+        return Wire.endTransmission() == 0;
+    }
+
+    void show(const String& line1, const String& line2)
+    {
+        String a = line1.substring(0, 16);
+        String b = line2.substring(0, 16);
+        if (a == line1_ && b == line2_) return;    // nothing changed
+        line1_ = a;
+        line2_ = b;
+
+        lcd_.clear();
+        lcd_.setCursor(0, 0);
+        lcd_.print(line1_);
+        lcd_.setCursor(0, 1);
+        lcd_.print(line2_);
+
+        /**
+         * @brief Performs the ublish operation for SlotStatus.
+         *
+         * @param line2_ Input/output parameter used by this operation.
+         *
+         * @return Result produced by the ublish operation.
+         */
+        publish("LCD " + line1_ + "|" + line2_);
+    }
+
+    /**
+     * @brief Publishes the current display contents without changing them.
+     */
+    void republish() const { publish("LCD " + line1_ + "|" + line2_); }
+
+private:
+    uint8_t           address_;
+    LiquidCrystal_I2C lcd_;
+    String            line1_ = "";
+    String            line2_ = "";
+};
+
+
+// ######################################################
+//            INPUT SOURCES (inheritance from InputSource)
+// ######################################################
+
+/**
+ * @brief Abstract interface for sources that generate normalized input events.
+ */
+class InputSource
+{
+public:
+    /**
+     * @brief Performs the input source operation for SlotStatus.
+     *
+     * @return Result produced by the input source operation.
+     */
+    virtual ~InputSource() {}
+    /**
+     * @brief Initializes the object and its associated hardware or runtime resources.
+     */
+    virtual void begin() {}
+    virtual void poll(Queue<InputEvent>& queue) = 0;
+};
+
+// ---------- Keypad (custom scanner) ----------
+/**
+ * @brief Scans the 4x4 keypad and converts stable key presses into input events.
+ */
+class KeypadInput : public InputSource
+{
+public:
+    void begin() override
+    {
+        for (byte r = 0; r < ROWS; r++) pinMode(ROW_PINS[r], INPUT_PULLUP);
+        for (byte c = 0; c < COLS; c++) pinMode(COL_PINS[c], INPUT);
+    }
+
+    void poll(Queue<InputEvent>& queue) override
+    {
+        char raw = scanRaw();
+        unsigned long now = millis();
+
+        /**
+         * @brief Performs the f operation for SlotStatus.
+         *
+         * @param raw Input/output parameter used by this operation.
+         *
+         * @return Result produced by the f operation.
+         */
+        if (raw != lastRaw_) { lastRaw_ = raw; lastChange_ = now; }
+
+        if (now - lastChange_ >= DEBOUNCE_MS && raw != stableKey_)
+        {
+            stableKey_ = raw;
+            if (stableKey_ != 0)
+            {
+                InputEvent e;
+                e.type = InputType::Key;
+                e.key  = stableKey_;
+                queue.push(e);
+            }
+        }
+    }
+
+    char scanRaw() const
+    {
+        char found = 0;
+        int  count = 0;
+
+        for (byte c = 0; c < COLS; c++)
+        {
+            /**
+             * @brief Performs the in mode operation for SlotStatus.
+             *
+             * @param c Input/output parameter used by this operation.
+             * @param OUTPUT Input/output parameter used by this operation.
+             *
+             * @return Result produced by the in mode operation.
+             */
+            pinMode(COL_PINS[c], OUTPUT);
+            /**
+             * @brief Performs the igital write operation for SlotStatus.
+             *
+             * @param c Input/output parameter used by this operation.
+             * @param LOW Input/output parameter used by this operation.
+             *
+             * @return Result produced by the igital write operation.
+             */
+            digitalWrite(COL_PINS[c], LOW);
+            /**
+             * @brief Performs the elay microseconds operation for SlotStatus.
+             *
+             * @return Result produced by the elay microseconds operation.
+             */
+            delayMicroseconds(20);
+
+            for (byte r = 0; r < ROWS; r++)
+            {
+                /**
+                 * @brief Performs the f operation for SlotStatus.
+                 *
+                 * @param r Input/output parameter used by this operation.
+                 *
+                 * @return Result produced by the f operation.
+                 */
+                if (digitalRead(ROW_PINS[r]) == LOW) { found = KEYS[r][c]; count++; }
+            }
+
+            /**
+             * @brief Performs the in mode operation for SlotStatus.
+             *
+             * @param c Input/output parameter used by this operation.
+             * @param INPUT Input/output parameter used by this operation.
+             *
+             * @return Result produced by the in mode operation.
+             */
+            pinMode(COL_PINS[c], INPUT);
+            /**
+             * @brief Performs the elay microseconds operation for SlotStatus.
+             *
+             * @return Result produced by the elay microseconds operation.
+             */
+            delayMicroseconds(20);
+        }
+        return (count == 1) ? found : 0;
+    }
+
+private:
+    static const byte ROWS = 4;
+    static const byte COLS = 4;
+    static constexpr unsigned long DEBOUNCE_MS = 30;
+    static constexpr byte ROW_PINS[ROWS] = { 0, 1, 2, 3 };
+    static constexpr byte COL_PINS[COLS] = { 12, 13, 14, 15 };
+    static constexpr char KEYS[ROWS][COLS] =
+    {
+        { '1', '2', '3', 'A' },
+        { '4', '5', '6', 'B' },
+        { '7', '8', '9', 'C' },
+        { '*', '0', '#', 'D' }
+    };
+
+    char          lastRaw_    = 0;
+    char          stableKey_  = 0;
+    unsigned long lastChange_ = 0;
+};
+
+// ---------- RFID ----------
+/**
+ * @brief Reads MFRC522 RFID cards and produces card input events.
+ */
+class RfidInput : public InputSource
+{
+public:
+    /**
+     * @brief Performs the fid input operation for SlotStatus.
+     *
+     * @param reader Input/output parameter used by this operation.
+     *
+     * @return Result produced by the fid input operation.
+     */
+    explicit RfidInput(MFRC522* reader) : reader_(reader) {}
+
+    void begin() override
+    {
+        SPI.setRX(RFID_MISO);
+        SPI.setCS(RFID_SS);
+        SPI.setSCK(RFID_SCK);
+        SPI.setTX(RFID_MOSI);
+        SPI.begin();
+        reader_->PCD_Init();
+    }
+
+    /**
+     * @brief Enables or disables the RFID input source.
+     *
+     * @param enabled Input/output parameter used by this operation.
+     */
+    void setEnabled(bool enabled) { enabled_ = enabled; }
+
+    bool detected() const
+    {
+        byte v = reader_->PCD_ReadRegister(MFRC522::VersionReg);
+        return !(v == 0x00 || v == 0xFF);
+    }
+
+    void poll(Queue<InputEvent>& queue) override
+    {
+        if (!enabled_) return;
+        if (!reader_->PICC_IsNewCardPresent()) return;
+        if (!reader_->PICC_ReadCardSerial())   return;
+
+        String uid = "";
+        for (byte i = 0; i < reader_->uid.size; i++)
+        {
+            if (reader_->uid.uidByte[i] < 0x10) uid += "0";
+            uid += String(reader_->uid.uidByte[i], HEX);
+        }
+        uid.toUpperCase();
+
+        reader_->PICC_HaltA();
+        reader_->PCD_StopCrypto1();
+
+        InputEvent e;
+        e.type = InputType::Card;
+        e.text = uid;
+        queue.push(e);
+    }
+
+private:
+    MFRC522* reader_;
+    bool     enabled_ = false;
+};
+
+// ---------- USB serial commands ----------
+/**
+ * @brief Receives and parses commands from the doctor GUI over USB Serial.
+ */
+class SerialInput : public InputSource
+{
+public:
+    void poll(Queue<InputEvent>& queue) override
+    {
+        while (Serial.available() > 0)
+        {
+            char c = (char)Serial.read();
+            if (c == '\n' || c == '\r')
+            {
+                /**
+                 * @brief Performs the f operation for SlotStatus.
+                 *
+                 * @param length Input/output parameter used by this operation.
+                 *
+                 * @return Result produced by the f operation.
+                 */
+                if (line_.length() > 0) { parse(line_, queue); line_ = ""; }
+            }
+            else if (line_.length() < 120)
+            {
+                line_ += c;
+            }
+        }
+    }
+
+private:
+    void parse(String cmd, Queue<InputEvent>& queue)
+    {
+        cmd.trim();
+        if (cmd.length() == 0) return;
+
+        String upper = cmd;
+        upper.toUpperCase();
+
+        InputEvent e;
+        e.text = cmd;
+
+        if      (upper == "HELLO")     e.type = InputType::Hello;
+        else if (upper == "STATUS")    e.type = InputType::Status;
+        else if (upper == "PING")      e.type = InputType::Ping;
+        else if (upper == "HISTORY")   e.type = InputType::History;
+        else if (upper == "CLEAR")     e.type = InputType::Clear;
+        else if (upper == "EXIT")      e.type = InputType::Exit;
+        else if (upper == "DOCLOGOUT") e.type = InputType::DocLogout;
+        else if (upper.startsWith("DOCLOGIN "))
+        {
+            e.type = InputType::DocLogin;
+            e.text = cmd.substring(9);
+            e.text.trim();
+        }
+        else if (upper.startsWith("RX "))
+        {
+            e.type = InputType::Prescription;
+            e.text = cmd.substring(3);          // keep original letter case
+            e.text.trim();
+        }
+        else if (upper.startsWith("SELECT "))
+        {
+            e.type = InputType::SelectBox;
+            e.box  = upper.substring(7).toInt();
+        }
+        else if (upper.startsWith("PIN "))
+        {
+            e.type = InputType::Pin;
+            e.text = upper.substring(4);
+            e.text.trim();
+        }
+        else
+        {
+            e.type = InputType::Unknown;
+        }
+
+        queue.push(e);
+    }
+
+    String line_ = "";
+};
+
+
+// ######################################################
+//        STRATEGY: AUTHENTICATORS (inheritance)
+// ######################################################
+
+/**
+ * @brief Strategy interface for credential authentication.
+ */
+class Authenticator
+{
+public:
+    /**
+     * @brief Performs the uthenticator operation for SlotStatus.
+     *
+     * @param users Input/output parameter used by this operation.
+     *
+     * @return Result produced by the uthenticator operation.
+     */
+    explicit Authenticator(const UserRegistry* users) : users_(users) {}
+    /**
+     * @brief Performs the authenticator operation for SlotStatus.
+     *
+     * @return Result produced by the authenticator operation.
+     */
+    virtual ~Authenticator() {}
+    virtual User*       authenticate(const String& credential) const = 0;
+    virtual const char* failText() const = 0;
+
+protected:
+    const UserRegistry* users_;
+};
+
+/**
+ * @brief Authenticates users using a numeric PIN.
+ */
+class PinAuthenticator : public Authenticator
+{
+public:
+    /**
+     * @brief Performs the in authenticator operation for SlotStatus.
+     *
+     * @param users Input/output parameter used by this operation.
+     *
+     * @return Result produced by the in authenticator operation.
+     */
+    explicit PinAuthenticator(const UserRegistry* users) : Authenticator(users) {}
+
+    User* authenticate(const String& pin) const override
+    {
+        if (pin.length() != PIN_LENGTH) return nullptr;
+        return users_->findByPin(pin);
+    }
+
+    /**
+     * @brief Returns the authentication failure message for this authenticator.
+     *
+     * @return Result produced by the fail text operation.
+     */
+    const char* failText() const override { return "Invalid PIN"; }
+};
+
+/**
+ * @brief Authenticates users using an RFID card UID.
+ */
+class RfidAuthenticator : public Authenticator
+{
+public:
+    /**
+     * @brief Performs the fid authenticator operation for SlotStatus.
+     *
+     * @param users Input/output parameter used by this operation.
+     *
+     * @return Result produced by the fid authenticator operation.
+     */
+    explicit RfidAuthenticator(const UserRegistry* users) : Authenticator(users) {}
+
+    /**
+     * @brief Validates the supplied credential and returns the matching user when successful.
+     *
+     * @param uid Input/output parameter used by this operation.
+     *
+     * @return Result produced by the authenticate operation.
+     */
+    User* authenticate(const String& uid) const override { return users_->findByUid(uid); }
+    /**
+     * @brief Returns the authentication failure message for this authenticator.
+     *
+     * @return Result produced by the fail text operation.
+     */
+    const char* failText() const override { return "Unknown Card"; }
+};
+
+
+// ######################################################
+//              STATE PATTERN - one class per phase
+// ######################################################
+
+/**
+ * @brief Singleton controller coordinating hardware, protocol, authentication and workflow state.
+ *
+ * This class is the central coordinator and owns the hardware devices,
+ * user registry, queues, prescription data and state objects.
+ */
+class Dispenser;
+
+/**
+ * @brief Abstract base class for the medicine-dispenser state machine.
+ */
+class DispenserState
+{
+public:
+    /**
+     * @brief Performs the dispenser state operation for SlotStatus.
+     *
+     * @return Result produced by the dispenser state operation.
+     */
+    virtual ~DispenserState() {}
+    virtual const char* mode() const = 0;                       // sent to the GUI
+    virtual void enter(Dispenser& d) = 0;                       // phase starts
+    virtual void handle(Dispenser& d, const InputEvent& e) = 0; // key / card / PC input
+    /**
+     * @brief Updates the object's state from current inputs and timing conditions.
+     *
+     * @param d Input/output parameter used by this operation.
+     */
+    virtual void update(Dispenser& d) { (void)d; }              // called every loop
+    /**
+     * @brief Refreshes the LCD for the current dispenser state.
+     *
+     * @param d Input/output parameter used by this operation.
+     */
+    virtual void redraw(Dispenser& d) { (void)d; }              // repaint the LCD
+    /**
+     * @brief Reports whether the current state is physically moving a medicine box.
+     *
+     * @return Result produced by the moving operation.
+     */
+    virtual bool moving() const { return false; }               // a box is open
+};
+
+// ---------- 1. Idle: waiting for a prescription ----------
+/**
+ * @brief State used while no prescription is active.
+ */
+class IdleState : public DispenserState
+{
+public:
+    /**
+     * @brief Returns the text identifier of the current dispenser state.
+     *
+     * @return Result produced by the mode operation.
+     */
+    const char* mode() const override { return "IDLE"; }
+    /**
+     * @brief Performs actions required when entering this dispenser state.
+     *
+     * @param d Input/output parameter used by this operation.
+     */
+    void enter(Dispenser& d) override;
+    /**
+     * @brief Handles an input event while this dispenser state is active.
+     *
+     * @param d Input/output parameter used by this operation.
+     * @param e Input/output parameter used by this operation.
+     */
+    void handle(Dispenser& d, const InputEvent& e) override;
+    /**
+     * @brief Refreshes the LCD for the current dispenser state.
+     *
+     * @param d Input/output parameter used by this operation.
+     */
+    void redraw(Dispenser& d) override;
+};
+
+// ---------- Code entry (base for refill / reset passcodes) ----------
+// Template Method: handle() collects the digits and checks the code,
+// subclasses decide what happens when the code is correct.
+/**
+ * @brief Shared base state for refill/reset code entry.
+ */
+class CodeEntryState : public DispenserState
+{
+public:
+    /**
+     * @brief Performs actions required when entering this dispenser state.
+     *
+     * @param d Input/output parameter used by this operation.
+     */
+    void enter(Dispenser& d) override;
+    /**
+     * @brief Handles an input event while this dispenser state is active.
+     *
+     * @param d Input/output parameter used by this operation.
+     * @param e Input/output parameter used by this operation.
+     */
+    void handle(Dispenser& d, const InputEvent& e) override;
+    /**
+     * @brief Refreshes the LCD for the current dispenser state.
+     *
+     * @param d Input/output parameter used by this operation.
+     */
+    void redraw(Dispenser& d) override;
+
+protected:
+    virtual const char* title() const = 0;          // LCD line 1
+    virtual void onCodeAccepted(Dispenser& d) = 0;  // what to do next
+};
+
+/**
+ * @brief Authorizes the start of a refill cycle.
+ */
+class RefillStartState : public CodeEntryState
+{
+public:
+    /**
+     * @brief Returns the text identifier of the current dispenser state.
+     *
+     * @return Result produced by the mode operation.
+     */
+    const char* mode() const override { return "REFILL_AUTH"; }
+protected:
+    /**
+     * @brief Returns the LCD title used by this code-entry state.
+     *
+     * @return Result produced by the title operation.
+     */
+    const char* title() const override { return "REFILLING"; }
+    /**
+     * @brief Handles a successfully entered refill/reset code.
+     *
+     * @param d Input/output parameter used by this operation.
+     */
+    void onCodeAccepted(Dispenser& d) override;
+};
+
+/**
+ * @brief Authorizes completion of a refill cycle.
+ */
+class RefillFinishState : public CodeEntryState
+{
+public:
+    /**
+     * @brief Returns the text identifier of the current dispenser state.
+     *
+     * @return Result produced by the mode operation.
+     */
+    const char* mode() const override { return "REFILL_DONE"; }
+protected:
+    /**
+     * @brief Returns the LCD title used by this code-entry state.
+     *
+     * @return Result produced by the title operation.
+     */
+    const char* title() const override { return "Refill complete"; }
+    /**
+     * @brief Handles a successfully entered refill/reset code.
+     *
+     * @param d Input/output parameter used by this operation.
+     */
+    void onCodeAccepted(Dispenser& d) override;
+};
+
+/**
+ * @brief Authorizes opening all boxes for reset/emptying.
+ */
+class ResetStartState : public CodeEntryState
+{
+public:
+    /**
+     * @brief Returns the text identifier of the current dispenser state.
+     *
+     * @return Result produced by the mode operation.
+     */
+    const char* mode() const override { return "RESET_AUTH"; }
+protected:
+    /**
+     * @brief Returns the LCD title used by this code-entry state.
+     *
+     * @return Result produced by the title operation.
+     */
+    const char* title() const override { return "RESET MODE"; }
+    /**
+     * @brief Handles a successfully entered refill/reset code.
+     *
+     * @param d Input/output parameter used by this operation.
+     */
+    void onCodeAccepted(Dispenser& d) override;
+};
+
+// ---------- 5. Complete: every prescribed medicine has been dispensed ----------
+// No box can be selected. The code refills the same prescription;
+// a new prescription from the doctor also leaves this state.
+/**
+ * @brief State entered after every prescribed medicine has been dispensed.
+ */
+class CompleteState : public CodeEntryState
+{
+public:
+    /**
+     * @brief Returns the text identifier of the current dispenser state.
+     *
+     * @return Result produced by the mode operation.
+     */
+    const char* mode() const override { return "COMPLETE"; }
+    /**
+     * @brief Handles an input event while this dispenser state is active.
+     *
+     * @param d Input/output parameter used by this operation.
+     * @param e Input/output parameter used by this operation.
+     */
+    void handle(Dispenser& d, const InputEvent& e) override;
+    /**
+     * @brief Refreshes the LCD for the current dispenser state.
+     *
+     * @param d Input/output parameter used by this operation.
+     */
+    void redraw(Dispenser& d) override;
+protected:
+    /**
+     * @brief Returns the LCD title used by this code-entry state.
+     *
+     * @return Result produced by the title operation.
+     */
+    const char* title() const override { return "All dispensed"; }
+    /**
+     * @brief Handles a successfully entered refill/reset code.
+     *
+     * @param d Input/output parameter used by this operation.
+     */
+    void onCodeAccepted(Dispenser& d) override;
+};
+
+// ---------- 3. Refill: open prescribed boxes one by one ----------
+/**
+ * @brief Sequentially opens prescribed boxes and waits for medicine loading.
+ */
+class RefillState : public DispenserState
+{
+public:
+    /**
+     * @brief Returns the text identifier of the current dispenser state.
+     *
+     * @return Result produced by the mode operation.
+     */
+    const char* mode() const override { return "REFILL"; }
+    /**
+     * @brief Performs actions required when entering this dispenser state.
+     *
+     * @param d Input/output parameter used by this operation.
+     */
+    void enter(Dispenser& d) override;
+    /**
+     * @brief Handles an input event while this dispenser state is active.
+     *
+     * @param d Input/output parameter used by this operation.
+     * @param e Input/output parameter used by this operation.
+     */
+    void handle(Dispenser& d, const InputEvent& e) override { (void)d; (void)e; }
+    /**
+     * @brief Updates the object's state from current inputs and timing conditions.
+     *
+     * @param d Input/output parameter used by this operation.
+     */
+    void update(Dispenser& d) override;
+    /**
+     * @brief Refreshes the LCD for the current dispenser state.
+     *
+     * @param d Input/output parameter used by this operation.
+     */
+    void redraw(Dispenser& d) override;
+    /**
+     * @brief Reports whether the current state is physically moving a medicine box.
+     *
+     * @return Result produced by the moving operation.
+     */
+    bool moving() const override { return true; }
+
+private:
+    /**
+     * @brief Advances the refill sequence to the next prescribed medicine box.
+     *
+     * @param d Input/output parameter used by this operation.
+     */
+    void nextBox(Dispenser& d);
+
+    int           box_        = 0;
+    unsigned long detectedAt_ = 0;
+};
+
+// ---------- 4. Ready: choose a box ----------
+/**
+ * @brief Allows selection of a loaded medicine box.
+ */
+class ReadyState : public DispenserState
+{
+public:
+    /**
+     * @brief Returns the text identifier of the current dispenser state.
+     *
+     * @return Result produced by the mode operation.
+     */
+    const char* mode() const override { return "READY"; }
+    /**
+     * @brief Performs actions required when entering this dispenser state.
+     *
+     * @param d Input/output parameter used by this operation.
+     */
+    void enter(Dispenser& d) override;
+    /**
+     * @brief Handles an input event while this dispenser state is active.
+     *
+     * @param d Input/output parameter used by this operation.
+     * @param e Input/output parameter used by this operation.
+     */
+    void handle(Dispenser& d, const InputEvent& e) override;
+    /**
+     * @brief Refreshes the LCD for the current dispenser state.
+     *
+     * @param d Input/output parameter used by this operation.
+     */
+    void redraw(Dispenser& d) override;
+
+private:
+    /**
+     * @brief Validates a requested medicine box and starts authentication when allowed.
+     *
+     * @param d Input/output parameter used by this operation.
+     * @param box Input/output parameter used by this operation.
+     */
+    void choose(Dispenser& d, int box);
+};
+
+// ---------- 4b. Log in for the chosen box ----------
+/**
+ * @brief Authenticates a user before opening the selected box.
+ */
+class AuthenticateState : public DispenserState
+{
+public:
+    /**
+     * @brief Returns the text identifier of the current dispenser state.
+     *
+     * @return Result produced by the mode operation.
+     */
+    const char* mode() const override { return "AUTH"; }
+    /**
+     * @brief Performs actions required when entering this dispenser state.
+     *
+     * @param d Input/output parameter used by this operation.
+     */
+    void enter(Dispenser& d) override;
+    /**
+     * @brief Handles an input event while this dispenser state is active.
+     *
+     * @param d Input/output parameter used by this operation.
+     * @param e Input/output parameter used by this operation.
+     */
+    void handle(Dispenser& d, const InputEvent& e) override;
+    /**
+     * @brief Updates the object's state from current inputs and timing conditions.
+     *
+     * @param d Input/output parameter used by this operation.
+     */
+    void update(Dispenser& d) override;
+    /**
+     * @brief Refreshes the LCD for the current dispenser state.
+     *
+     * @param d Input/output parameter used by this operation.
+     */
+    void redraw(Dispenser& d) override;
+};
+
+// ---------- 4c. Dispense: box open until the medicine is taken ----------
+/**
+ * @brief Opens the selected box and monitors medicine collection.
+ */
+class DispenseState : public DispenserState
+{
+public:
+    /**
+     * @brief Returns the text identifier of the current dispenser state.
+     *
+     * @return Result produced by the mode operation.
+     */
+    const char* mode() const override { return "DISPENSE"; }
+    /**
+     * @brief Performs actions required when entering this dispenser state.
+     *
+     * @param d Input/output parameter used by this operation.
+     */
+    void enter(Dispenser& d) override;
+    /**
+     * @brief Handles an input event while this dispenser state is active.
+     *
+     * @param d Input/output parameter used by this operation.
+     * @param e Input/output parameter used by this operation.
+     */
+    void handle(Dispenser& d, const InputEvent& e) override { (void)d; (void)e; }
+    /**
+     * @brief Updates the object's state from current inputs and timing conditions.
+     *
+     * @param d Input/output parameter used by this operation.
+     */
+    void update(Dispenser& d) override;
+    /**
+     * @brief Refreshes the LCD for the current dispenser state.
+     *
+     * @param d Input/output parameter used by this operation.
+     */
+    void redraw(Dispenser& d) override;
+    /**
+     * @brief Reports whether the current state is physically moving a medicine box.
+     *
+     * @return Result produced by the moving operation.
+     */
+    bool moving() const override { return true; }
+
+private:
+    unsigned long openedAt_ = 0;
+    unsigned long takenAt_  = 0;
+};
+
+// ---------- 6. Reset: all boxes open until empty ----------
+/**
+ * @brief Keeps all boxes open until every IR sensor confirms empty.
+ */
+class ResetState : public DispenserState
+{
+public:
+    /**
+     * @brief Returns the text identifier of the current dispenser state.
+     *
+     * @return Result produced by the mode operation.
+     */
+    const char* mode() const override { return "RESET"; }
+    /**
+     * @brief Performs actions required when entering this dispenser state.
+     *
+     * @param d Input/output parameter used by this operation.
+     */
+    void enter(Dispenser& d) override;
+    /**
+     * @brief Handles an input event while this dispenser state is active.
+     *
+     * @param d Input/output parameter used by this operation.
+     * @param e Input/output parameter used by this operation.
+     */
+    void handle(Dispenser& d, const InputEvent& e) override { (void)d; (void)e; }
+    /**
+     * @brief Updates the object's state from current inputs and timing conditions.
+     *
+     * @param d Input/output parameter used by this operation.
+     */
+    void update(Dispenser& d) override;
+    /**
+     * @brief Reports whether the current state is physically moving a medicine box.
+     *
+     * @return Result produced by the moving operation.
+     */
+    bool moving() const override { return true; }
+
+private:
+    unsigned long emptySince_ = 0;
+};
+
+
+// ######################################################
+//          DISPENSER - Singleton + Facade
+// ######################################################
+
+/**
+ * @brief Singleton controller coordinating hardware, protocol, authentication and workflow state.
+ *
+ * This class is the central coordinator and owns the hardware devices,
+ * user registry, queues, prescription data and state objects.
+ */
+class Dispenser
+{
+public:
+    static Dispenser& instance()
+    {
+        static Dispenser theDispenser;
+        return theDispenser;
+    }
+
+    Dispenser(const Dispenser&) = delete;
+    Dispenser& operator=(const Dispenser&) = delete;
+
+    /**
+     * @brief Initializes the object and its associated hardware or runtime resources.
+     */
+    void begin();
+    /**
+     * @brief Runs one iteration of the medicine dispenser control loop.
+     */
+    void loop();
+
+    // ---------- state changes ----------
+    void changeState(DispenserState* next)
+    {
+        state_ = next;
+        /**
+         * @brief Performs the mit operation for SlotStatus.
+         *
+         * @param selectedBox_ Input/output parameter used by this operation.
+         *
+         * @return Result produced by the mit operation.
+         */
+        emit(String("MODE ") + state_->mode() + " " + String(selectedBox_));
+        state_->enter(*this);
+    }
+
+    /**
+     * @brief Transitions the controller to the idle state.
+     *
+     * @param line2 Input/output parameter used by this operation.
+     */
+    void goIdle(const char* line2)  { idleMessage_ = line2; changeState(&idleState_); }
+    /**
+     * @brief Transitions the controller to the ready state.
+     */
+    void goReady()                  { changeState(&readyState_); }
+    /**
+     * @brief Transitions the controller to refill-code authorization.
+     */
+    void goRefillStart()            { changeState(&refillStartState_); }
+    /**
+     * @brief Transitions the controller to the refill sequence.
+     */
+    void goRefill()                 { changeState(&refillState_); }
+    /**
+     * @brief Transitions the controller to refill-completion authorization.
+     */
+    void goRefillFinish()           { changeState(&refillFinishState_); }
+    /**
+     * @brief Transitions the controller to reset/emptying mode.
+     */
+    void goReset()                  { changeState(&resetState_); }
+    /**
+     * @brief Transitions the controller to the prescription-complete state.
+     */
+    void goComplete()               { changeState(&completeState_); }
+    /**
+     * @brief Stores the selected medicine box and starts user authentication.
+     *
+     * @param box Input/output parameter used by this operation.
+     */
+    void selectBox(int box)         { selectedBox_ = box; changeState(&authState_); }
+    /**
+     * @brief Transitions the controller to the medicine-dispensing state.
+     */
+    void startDispense()            { changeState(&dispenseState_); }
+
+    /**
+     * @brief Publishes a protocol event to connected listeners.
+     *
+     * @param event Input/output parameter used by this operation.
+     */
+    void emit(const String& event) const { bus_.publish(event); }
+
+    // ---------- session helpers ----------
+    /**
+     * @brief Clears the current box selection, authentication attempts and PIN buffer.
+     */
+    void resetSession()   { selectedBox_ = 0; attempts_ = 0; pin_.clear(); }
+    /**
+     * @brief Refreshes the login-session activity timestamp.
+     */
+    void touch()          { lastActivity_ = millis(); }
+    /**
+     * @brief Checks whether the current login session has exceeded its inactivity timeout.
+     *
+     * @return Result produced by the timed out operation.
+     */
+    bool timedOut() const { return millis() - lastActivity_ > LOGIN_TIMEOUT; }
+    /**
+     * @brief Resets the failed-authentication attempt counter.
+     */
+    void clearAttempts()  { attempts_ = 0; }
+
+    // ---------- actions used by the states ----------
+    /**
+     * @brief Attempts authentication using the supplied strategy and credential.
+     *
+     * @param auth Input/output parameter used by this operation.
+     * @param credential Input/output parameter used by this operation.
+     * @param method Input/output parameter used by this operation.
+     */
+    void tryLogin(const Authenticator& auth, const String& credential, const char* method);
+    /**
+     * @brief Processes a failed authentication attempt and lockout handling.
+     *
+     * @param text Input/output parameter used by this operation.
+     * @param method Input/output parameter used by this operation.
+     */
+    void handleFailedAttempt(const char* text, const char* method);
+    /**
+     * @brief Handles expiration of the current authentication session.
+     */
+    void handleTimeout();
+    /**
+     * @brief Displays the masked refill/reset code-entry screen.
+     *
+     * @param title Input/output parameter used by this operation.
+     */
+    void showCodeScreen(const char* title);
+    /**
+     * @brief Displays the selected-box authentication screen.
+     */
+    void showLoginScreen();
+
+    /**
+     * @brief Activates the pending prescription and prepares box slot states.
+     */
+    void activatePendingPrescription();
+    /**
+     * @brief Marks the refill sequence as complete and advances the workflow.
+     */
+    void markRefilled();
+    /**
+     * @brief Completes a dispense attempt and records whether medicine was collected.
+     *
+     * @param taken Input/output parameter used by this operation.
+     */
+    void finishDispense(bool taken);
+    /**
+     * @brief Completes reset mode after all medicine boxes are confirmed empty.
+     */
+    void finishReset();
+    /**
+     * @brief Prepares all prescribed slots for refilling the same prescription.
+     */
+    void refillSamePrescription();
+    /**
+     * @brief Ensures the controller enters the complete state once all prescribed medicine is dispensed.
+     */
+    void checkCompletion();
+
+    bool anyPresent() const
+    {
+        for (int i = 0; i < BOX_COUNT; i++) if (irs_[i]->present()) return true;
+        return false;
+    }
+
+    bool allDispensed() const
+    {
+        bool any = false;
+        for (int b = 1; b <= BOX_COUNT; b++)
+        {
+            const BoxSlot& s = slots_[b];
+            if (!s.prescribed) continue;
+            any = true;
+            if (s.status != SlotStatus::Dispensed) return false;
+        }
+        return any;
+    }
+
+    void setSlot(int box, SlotStatus status)
+    {
+        slots_[box].status = status;
+        /**
+         * @brief Performs the mit slot operation for SlotStatus.
+         *
+         * @param box Input/output parameter used by this operation.
+         *
+         * @return Result produced by the mit slot operation.
+         */
+        emitSlot(box);
+    }
+
+    void emitSlot(int box) const
+    {
+        const BoxSlot& s = slots_[box];
+        /**
+         * @brief Performs the mit operation for SlotStatus.
+         *
+         * @param medicine Input/output parameter used by this operation.
+         *
+         * @return Result produced by the mit operation.
+         */
+        emit("SLOT " + String(box) + " " + s.statusName() + " " + s.medicine);
+    }
+
+    void logHistory(int box, const String& who, const String& method, const String& result)
+    {
+        history_.add(box, who, method, result);
+    }
+
+    // ---------- accessors ----------
+    /**
+     * @brief Performs the lcd operation for SlotStatus.
+     *
+     * @return Result produced by the lcd operation.
+     */
+    LcdDisplay&              lcd()               { return lcd_; }
+    /**
+     * @brief Performs the rfid operation for SlotStatus.
+     *
+     * @return Result produced by the rfid operation.
+     */
+    RfidInput&               rfid()              { return rfidInput_; }
+    /**
+     * @brief Performs the pin operation for SlotStatus.
+     *
+     * @return Result produced by the pin operation.
+     */
+    PinStack&                pin()               { return pin_; }
+    /**
+     * @brief Performs the pin auth operation for SlotStatus.
+     *
+     * @return Result produced by the pin auth operation.
+     */
+    const PinAuthenticator&  pinAuth()           { return pinAuth_; }
+    /**
+     * @brief Performs the rfid auth operation for SlotStatus.
+     *
+     * @return Result produced by the rfid auth operation.
+     */
+    const RfidAuthenticator& rfidAuth()          { return rfidAuth_; }
+    /**
+     * @brief Performs the servo operation for SlotStatus.
+     *
+     * @param box Input/output parameter used by this operation.
+     *
+     * @return Result produced by the servo operation.
+     */
+    BoxServo*                servo(int box)      { return (box >= 1 && box <= BOX_COUNT) ? boxes_[box - 1] : nullptr; }
+    /**
+     * @brief Performs the ir operation for SlotStatus.
+     *
+     * @param box Input/output parameter used by this operation.
+     *
+     * @return Result produced by the ir operation.
+     */
+    IrSensor*                ir(int box)         { return (box >= 1 && box <= BOX_COUNT) ? irs_[box - 1] : nullptr; }
+    /**
+     * @brief Performs the slot operation for SlotStatus.
+     *
+     * @param box Input/output parameter used by this operation.
+     *
+     * @return Result produced by the slot operation.
+     */
+    BoxSlot*                 slot(int box)       { return (box >= 1 && box <= BOX_COUNT) ? &slots_[box] : nullptr; }
+    /**
+     * @brief Performs the refill queue operation for SlotStatus.
+     *
+     * @return Result produced by the refill queue operation.
+     */
+    Queue<int>&              refillQueue()       { return refillQueue_; }
+    /**
+     * @brief Performs the prescription operation for SlotStatus.
+     *
+     * @return Result produced by the prescription operation.
+     */
+    const Prescription&      prescription() const { return rx_; }
+    /**
+     * @brief Performs the selected box operation for SlotStatus.
+     *
+     * @return Result produced by the selected box operation.
+     */
+    int                      selectedBox() const { return selectedBox_; }
+    /**
+     * @brief Performs the idle message operation for SlotStatus.
+     *
+     * @return Result produced by the idle message operation.
+     */
+    const String&            idleMessage() const { return idleMessage_; }
+    /**
+     * @brief Performs the has pending operation for SlotStatus.
+     *
+     * @return Result produced by the has pending operation.
+     */
+    bool                     hasPending()  const { return hasPending_; }
+    /**
+     * @brief Performs the last user operation for SlotStatus.
+     *
+     * @return Result produced by the last user operation.
+     */
+    User*                    lastUser()    const { return lastUser_; }
+    /**
+     * @brief Performs the last method operation for SlotStatus.
+     *
+     * @return Result produced by the last method operation.
+     */
+    const String&            lastMethod()  const { return lastMethod_; }
+
+private:
+    /**
+     * @brief Performs the ispenser operation for SlotStatus.
+     *
+     * @return Result produced by the ispenser operation.
+     */
+    Dispenser();
+
+    /**
+     * @brief Runs the start-up hardware self-test for keypad, RFID, LCD, IR sensors and servos.
+     */
+    void runSelfCheck();
+    /**
+     * @brief Routes one queued input event to the appropriate controller operation or active state.
+     *
+     * @param e Input/output parameter used by this operation.
+     */
+    void dispatch(const InputEvent& e);
+    /**
+     * @brief Publishes firmware identity and configured user-role information to the GUI.
+     */
+    void sendHello();
+    /**
+     * @brief Publishes the current dispenser mode, prescription, slot and sensor status.
+     */
+    void sendStatus();
+    /**
+     * @brief Publishes stored access-history records to the GUI.
+     */
+    void sendHistory();
+    /**
+     * @brief Publishes the currently active prescription to the GUI.
+     */
+    void sendPrescription() const;
+    /**
+     * @brief Processes a successfully authenticated user and enforces box access level.
+     *
+     * @param user Input/output parameter used by this operation.
+     * @param method Input/output parameter used by this operation.
+     */
+    void handleUser(User* user, const char* method);
+    /**
+     * @brief Authenticates a doctor login request received from the GUI.
+     *
+     * @param pin Input/output parameter used by this operation.
+     */
+    void doctorLogin(const String& pin);
+    /**
+     * @brief Validates and accepts a prescription received from the GUI.
+     *
+     * @param body Input/output parameter used by this operation.
+     */
+    void receivePrescription(const String& body);
+    /**
+     * @brief Parses a GUI prescription payload into a Prescription object.
+     *
+     * @param body Input/output parameter used by this operation.
+     * @param out Input/output parameter used by this operation.
+     *
+     * @return Result produced by the parse prescription operation.
+     */
+    bool parsePrescription(const String& body, Prescription& out) const;
+
+    // Observer
+    EventBus       bus_;
+    SerialReporter reporter_;
+
+    // Devices
+    LcdDisplay lcd_;
+    BoxServo*  boxes_[BOX_COUNT];
+    IrSensor*  irs_[BOX_COUNT];
+    Device*    devices_[1 + 2 * BOX_COUNT];
+    int        deviceCount_ = 0;
+
+    // Inputs
+    MFRC522           reader_;
+    KeypadInput       keypadInput_;
+    RfidInput         rfidInput_;
+    SerialInput       serialInput_;
+    InputSource*      inputs_[3];
+    Queue<InputEvent> inputQueue_;
+
+    // Users
+    UserRegistry      users_;
+    PinAuthenticator  pinAuth_;
+    RfidAuthenticator rfidAuth_;
+    AccessHistory     history_;
+
+    // Prescription data
+    Prescription rx_;
+    Prescription pending_;
+    bool         hasPending_ = false;
+    BoxSlot      slots_[BOX_COUNT + 1];      // index 1..3
+    Queue<int>   refillQueue_;
+
+    // Doctor session (GUI)
+    User*         doctor_       = nullptr;
+    unsigned long doctorSince_  = 0;
+
+    // States
+    IdleState          idleState_;
+    RefillStartState   refillStartState_;
+    RefillState        refillState_;
+    RefillFinishState  refillFinishState_;
+    ReadyState         readyState_;
+    AuthenticateState  authState_;
+    DispenseState      dispenseState_;
+    ResetStartState    resetStartState_;
+    ResetState         resetState_;
+    CompleteState      completeState_;
+    DispenserState*    state_ = nullptr;
+
+    // Session
+    int           selectedBox_  = 0;
+    PinStack      pin_;
+    int           attempts_     = 0;
+    unsigned long lastActivity_ = 0;
+    bool          locked_       = false;
+    String        idleMessage_  = "Waiting for Rx";
+    User*         lastUser_     = nullptr;
+    String        lastMethod_   = "";
+};
+
+// ------------------------------------------------------
+// Construction (no hardware access here)
+// ------------------------------------------------------
+Dispenser::Dispenser()
+    : lcd_("LCD", LCD_ADDRESS, &bus_),
+      reader_(RFID_SS, RFID_RST),
+      rfidInput_(&reader_),
+      inputQueue_(QUEUE_SIZE),
+      pinAuth_(&users_),
+      rfidAuth_(&users_),
+      history_(HISTORY_SIZE),
+      refillQueue_(BOX_COUNT),
+      pin_(PIN_LENGTH)
+{
+    bus_.subscribe(&reporter_);
+
+    boxes_[0] = new BoxServo("Servo 1", SERVO_GENERAL, 1, &bus_);
+    boxes_[1] = new BoxServo("Servo 2", SERVO_SEVERE,  2, &bus_);
+    boxes_[2] = new BoxServo("Servo 3", SERVO_HIGH,    3, &bus_);
+
+    irs_[0] = new IrSensor("IR 1", IR_BOX1, 1, &bus_);
+    irs_[1] = new IrSensor("IR 2", IR_BOX2, 2, &bus_);
+    irs_[2] = new IrSensor("IR 3", IR_BOX3, 3, &bus_);
+
+    for (int b = 1; b <= BOX_COUNT; b++) slots_[b].box = b;
+
+    devices_[deviceCount_++] = &lcd_;
+    for (int i = 0; i < BOX_COUNT; i++) devices_[deviceCount_++] = boxes_[i];
+    for (int i = 0; i < BOX_COUNT; i++) devices_[deviceCount_++] = irs_[i];
+
+    inputs_[0] = &keypadInput_;
+    inputs_[1] = &serialInput_;
+    inputs_[2] = &rfidInput_;
+}
+
+// ------------------------------------------------------
+// Start-up: self-check, then initialise
+// ------------------------------------------------------
+void Dispenser::begin()
+{
+    for (int i = 0; i < deviceCount_; i++) devices_[i]->begin();   // virtual
+    for (int i = 0; i < 3; i++)            inputs_[i]->begin();    // virtual
+    for (int i = 0; i < USER_TABLE_SIZE; i++) users_.add(UserFactory::create(USER_TABLE[i]));
+
+    lcd_.show("MED DISPENSER", "Self-check...");
+    Serial.println("MEDICINE DISPENSER VERSION 6.2");
+    /**
+     * @brief Performs the end hello operation for SlotStatus.
+     *
+     * @return Result produced by the end hello operation.
+     */
+    sendHello();
+    /**
+     * @brief Performs the un self check operation for SlotStatus.
+     *
+     * @return Result produced by the un self check operation.
+     */
+    runSelfCheck();
+
+    lcd_.show("Initialising", "dispenser...");
+    /**
+     * @brief Performs the elay operation for SlotStatus.
+     *
+     * @return Result produced by the elay operation.
+     */
+    delay(800);
+
+    // The boxes are empty at start-up, so always begin with the
+    // first prescription (no reset here).
+    /**
+     * @brief Performs the o idle operation for SlotStatus.
+     *
+     * @param Rx Input/output parameter used by this operation.
+     *
+     * @return Result produced by the o idle operation.
+     */
+    goIdle("Waiting for Rx");
+}
+
+void Dispenser::runSelfCheck()
+{
+    int failures = 0;
+
+    // LCD
+    if (lcd_.detected())
+    {
+        /**
+         * @brief Performs the mit operation for SlotStatus.
+         *
+         * @param HEX Input/output parameter used by this operation.
+         *
+         * @return Result produced by the mit operation.
+         */
+        emit("CHECK LCD OK found at 0x" + String(LCD_ADDRESS, HEX));
+    }
+    else
+    {
+        /**
+         * @brief Performs the mit operation for SlotStatus.
+         *
+         * @param GP9 Input/output parameter used by this operation.
+         *
+         * @return Result produced by the mit operation.
+         */
+        emit("CHECK LCD FAIL not found on I2C - check SDA GP8 / SCL GP9");
+        failures++;
+    }
+
+    // RFID
+    lcd_.show("Check: RFID", "");
+    if (rfidInput_.detected())
+    {
+        /**
+         * @brief Performs the mit operation for SlotStatus.
+         *
+         * @param found Input/output parameter used by this operation.
+         *
+         * @return Result produced by the mit operation.
+         */
+        emit("CHECK RFID OK reader found");
+    }
+    else
+    {
+        /**
+         * @brief Performs the mit operation for SlotStatus.
+         *
+         * @param V Input/output parameter used by this operation.
+         *
+         * @return Result produced by the mit operation.
+         */
+        emit("CHECK RFID FAIL reader not found - check SPI wiring and 3.3V");
+        failures++;
+    }
+    /**
+     * @brief Performs the elay operation for SlotStatus.
+     *
+     * @return Result produced by the elay operation.
+     */
+    delay(200);
+
+    // Keypad
+    lcd_.show("Check: Keypad", "");
+    char stuck = keypadInput_.scanRaw();
+    if (stuck != 0)
+    {
+        /**
+         * @brief Performs the mit operation for SlotStatus.
+         *
+         * @param wiring Input/output parameter used by this operation.
+         *
+         * @return Result produced by the mit operation.
+         */
+        emit(String("CHECK KEYPAD FAIL key ") + stuck + " reads as pressed - check wiring");
+        failures++;
+    }
+    else
+    {
+        /**
+         * @brief Performs the mit operation for SlotStatus.
+         *
+         * @param keys Input/output parameter used by this operation.
+         *
+         * @return Result produced by the mit operation.
+         */
+        emit("CHECK KEYPAD OK no stuck keys");
+    }
+    /**
+     * @brief Performs the elay operation for SlotStatus.
+     *
+     * @return Result produced by the elay operation.
+     */
+    delay(200);
+
+    // IR sensors
+    lcd_.show("Check: IR", "");
+    for (int i = 0; i < BOX_COUNT; i++)
+    {
+        int  box     = i + 1;
+        bool present = irs_[i]->readRaw();
+        /**
+         * @brief Performs the mit operation for SlotStatus.
+         *
+         * @param present Input/output parameter used by this operation.
+         *
+         * @return Result produced by the mit operation.
+         */
+        emit("IR " + String(box) + (present ? " 1" : " 0"));
+        /**
+         * @brief Performs the f operation for SlotStatus.
+         *
+         * @param IR_ACTIVE_LOW Input/output parameter used by this operation.
+         *
+         * @return Result produced by the f operation.
+         */
+        if (present) emit("CHECK IR" + String(box) + " WARN reads 'item inside' but boxes should be empty - calibrate the sensor or check IR_ACTIVE_LOW");
+        /**
+         * @brief Publishes a protocol event to connected listeners.
+         *
+         * @param empty Input/output parameter used by this operation.
+         *
+         * @return Result produced by the emit operation.
+         */
+        else         emit("CHECK IR" + String(box) + " OK box " + String(box) + " empty");
+    }
+    /**
+     * @brief Performs the elay operation for SlotStatus.
+     *
+     * @return Result produced by the elay operation.
+     */
+    delay(200);
+
+    // Servos (no feedback - each one moves a little so you can watch)
+    for (int i = 0; i < BOX_COUNT; i++)
+    {
+        lcd_.show("Check: Servo " + String(i + 1), "");
+        boxes_[i]->wiggle();
+        /**
+         * @brief Performs the mit operation for SlotStatus.
+         *
+         * @param moved Input/output parameter used by this operation.
+         *
+         * @return Result produced by the mit operation.
+         */
+        emit("CHECK SERVO" + String(i + 1) + " OK moved");
+    }
+
+    /**
+     * @brief Performs the mit operation for SlotStatus.
+     *
+     * @param failures Input/output parameter used by this operation.
+     *
+     * @return Result produced by the mit operation.
+     */
+    emit("CHECK DONE " + String(failures));
+
+    if (failures == 0)
+    {
+        lcd_.show("Self-check OK", "All parts ready");
+        /**
+         * @brief Performs the elay operation for SlotStatus.
+         *
+         * @return Result produced by the elay operation.
+         */
+        delay(1200);
+    }
+    else
+    {
+        lcd_.show("Self-check", String(failures) + " part(s) FAIL");
+        /**
+         * @brief Performs the elay operation for SlotStatus.
+         *
+         * @return Result produced by the elay operation.
+         */
+        delay(2500);
+    }
+}
+
+// ------------------------------------------------------
+// Main loop
+// ------------------------------------------------------
+void Dispenser::loop()
+{
+    for (int i = 0; i < BOX_COUNT; i++) irs_[i]->update();
+    for (int i = 0; i < 3; i++) inputs_[i]->poll(inputQueue_);
+
+    InputEvent e;
+    /**
+     * @brief Performs the hile operation for SlotStatus.
+     *
+     * @param e Input/output parameter used by this operation.
+     *
+     * @return Result produced by the hile operation.
+     */
+    while (inputQueue_.pop(e)) dispatch(e);
+
+    // End the doctor session after DOCTOR_SESSION ms
+    if (doctor_ != nullptr && millis() - doctorSince_ > DOCTOR_SESSION)
+    {
+        doctor_ = nullptr;
+        /**
+         * @brief Performs the mit operation for SlotStatus.
+         *
+         * @param OUT Input/output parameter used by this operation.
+         *
+         * @return Result produced by the mit operation.
+         */
+        emit("DOC OUT");
+    }
+
+    state_->update(*this);
+    /**
+     * @brief Performs the heck completion operation for SlotStatus.
+     *
+     * @return Result produced by the heck completion operation.
+     */
+    checkCompletion();
+}
+
+void Dispenser::dispatch(const InputEvent& e)
+{
+    switch (e.type)
+    {
+        /**
+         * @brief Publishes firmware identity and configured user-role information to the GUI.
+         *
+         * @return Result produced by the send hello operation.
+         */
+        case InputType::Hello:        sendHello(); sendStatus();      return;
+        /**
+         * @brief Publishes the current dispenser mode, prescription, slot and sensor status.
+         *
+         * @return Result produced by the send status operation.
+         */
+        case InputType::Status:       sendStatus();                   return;
+        /**
+         * @brief Publishes a protocol event to connected listeners.
+         *
+         * @param PONG Input/output parameter used by this operation.
+         *
+         * @return Result produced by the emit operation.
+         */
+        case InputType::Ping:         emit("PONG");                   return;
+        /**
+         * @brief Publishes stored access-history records to the GUI.
+         *
+         * @return Result produced by the send history operation.
+         */
+        case InputType::History:      sendHistory();                  return;
+        /**
+         * @brief Authenticates a doctor login request received from the GUI.
+         *
+         * @param text Input/output parameter used by this operation.
+         *
+         * @return Result produced by the doctor login operation.
+         */
+        case InputType::DocLogin:     doctorLogin(e.text);            return;
+        case InputType::DocLogout:    doctor_ = nullptr; emit("DOC OUT"); return;
+        /**
+         * @brief Validates and accepts a prescription received from the GUI.
+         *
+         * @param text Input/output parameter used by this operation.
+         *
+         * @return Result produced by the receive prescription operation.
+         */
+        case InputType::Prescription: receivePrescription(e.text);    return;
+        /**
+         * @brief Publishes a protocol event to connected listeners.
+         *
+         * @param text Input/output parameter used by this operation.
+         *
+         * @return Result produced by the emit operation.
+         */
+        case InputType::Unknown:      emit("ERR unknown command: " + e.text); return;
+        /**
+         * @brief Publishes a protocol event to connected listeners.
+         *
+         * @param key Input/output parameter used by this operation.
+         *
+         * @return Result produced by the emit operation.
+         */
+        case InputType::Key:          emit(String("KEY ") + e.key);   break;
+        default: break;
+    }
+
+    state_->handle(*this, e);
+}
+
+// ------------------------------------------------------
+// Reports to the GUI
+// ------------------------------------------------------
+void Dispenser::sendHello()
+{
+    /**
+     * @brief Performs the mit operation for SlotStatus.
+     *
+     * @param FIRMWARE_VERSION Input/output parameter used by this operation.
+     *
+     * @return Result produced by the mit operation.
+     */
+    emit(String("READY ") + FIRMWARE_VERSION);
+    for (int b = 1; b <= BOX_COUNT; b++) emit("BOX " + String(b) + " " + BOX_NAMES[b]);
+    /**
+     * @brief Performs the or operation for SlotStatus.
+     *
+     * @param u Input/output parameter used by this operation.
+     *
+     * @return Result produced by the or operation.
+     */
+    for (User* u = users_.first(); u != nullptr; u = u->next)
+    {
+        /**
+         * @brief Performs the mit operation for SlotStatus.
+         *
+         * @param name Input/output parameter used by this operation.
+         *
+         * @return Result produced by the mit operation.
+         */
+        emit("ROLE " + String(u->level) + " " + u->name);
+    }
+}
+
+void Dispenser::sendPrescription() const
+{
+    /**
+     * @brief Performs the f operation for SlotStatus.
+     *
+     * @param active Input/output parameter used by this operation.
+     *
+     * @return Result produced by the f operation.
+     */
+    if (!rx_.active) { emit("RX NONE"); return; }
+    /**
+     * @brief Performs the mit operation for SlotStatus.
+     *
+     * @param medicine Input/output parameter used by this operation.
+     *
+     * @return Result produced by the mit operation.
+     */
+    emit("RX " + rx_.patient + "|" + rx_.medicine[1] + "|" + rx_.medicine[2] + "|" + rx_.medicine[3]);
+}
+
+void Dispenser::sendStatus()
+{
+    const char* m = locked_ ? "LOCKED" : (state_ ? state_->mode() : "BOOT");
+    /**
+     * @brief Performs the mit operation for SlotStatus.
+     *
+     * @param selectedBox_ Input/output parameter used by this operation.
+     *
+     * @return Result produced by the mit operation.
+     */
+    emit(String("MODE ") + m + " " + String(selectedBox_));
+    /**
+     * @brief Performs the mit operation for SlotStatus.
+     *
+     * @param MAX_ATTEMPTS Input/output parameter used by this operation.
+     *
+     * @return Result produced by the mit operation.
+     */
+    emit(String("STATUS ") + m + " " + String(selectedBox_) + " " + String(attempts_) + " " + String(MAX_ATTEMPTS));
+    /**
+     * @brief Performs the f operation for SlotStatus.
+     *
+     * @param doctor_ Input/output parameter used by this operation.
+     *
+     * @return Result produced by the f operation.
+     */
+    if (doctor_ != nullptr) emit("DOC OK " + doctor_->name);
+    /**
+     * @brief Publishes a protocol event to connected listeners.
+     *
+     * @param OUT Input/output parameter used by this operation.
+     *
+     * @return Result produced by the emit operation.
+     */
+    else                    emit("DOC OUT");
+    /**
+     * @brief Performs the end prescription operation for SlotStatus.
+     *
+     * @return Result produced by the end prescription operation.
+     */
+    sendPrescription();
+    for (int b = 1; b <= BOX_COUNT; b++)
+    {
+        /**
+         * @brief Performs the mit slot operation for SlotStatus.
+         *
+         * @param b Input/output parameter used by this operation.
+         *
+         * @return Result produced by the mit slot operation.
+         */
+        emitSlot(b);
+        /**
+         * @brief Performs the mit operation for SlotStatus.
+         *
+         * @param present Input/output parameter used by this operation.
+         *
+         * @return Result produced by the mit operation.
+         */
+        emit("IR " + String(b) + (irs_[b - 1]->present() ? " 1" : " 0"));
+    }
+    lcd_.republish();
+    /**
+     * @brief Performs the mit operation for SlotStatus.
+     *
+     * @param size Input/output parameter used by this operation.
+     *
+     * @return Result produced by the mit operation.
+     */
+    emit("PINLEN " + String(pin_.size()));
+}
+
+void Dispenser::sendHistory()
+{
+    unsigned long now = millis();
+    history_.forEachNewestFirst([&](const AccessRecord& r)
+    {
+        emit("HIST " + String((now - r.timeMs) / 1000) + " " + String(r.box) + " " +
+             r.method + " " + r.result + " " + r.who);
+    });
+    /**
+     * @brief Performs the mit operation for SlotStatus.
+     *
+     * @param size Input/output parameter used by this operation.
+     *
+     * @return Result produced by the mit operation.
+     */
+    emit("HIST END " + String(history_.size()));
+}
+
+// ------------------------------------------------------
+// Doctor and prescription (from the GUI)
+// ------------------------------------------------------
+void Dispenser::doctorLogin(const String& pin)
+{
+    User* u = pinAuth_.authenticate(pin);
+    if (u != nullptr && u->canPrescribe)
+    {
+        doctor_      = u;
+        doctorSince_ = millis();
+        /**
+         * @brief Performs the og history operation for SlotStatus.
+         *
+         * @param name Input/output parameter used by this operation.
+         * @param PC Input/output parameter used by this operation.
+         * @param DOCLOGIN Input/output parameter used by this operation.
+         *
+         * @return Result produced by the og history operation.
+         */
+        logHistory(0, u->name, "PC", "DOCLOGIN");
+        /**
+         * @brief Performs the mit operation for SlotStatus.
+         *
+         * @param name Input/output parameter used by this operation.
+         *
+         * @return Result produced by the mit operation.
+         */
+        emit("DOC OK " + u->name);
+    }
+    else
+    {
+        /**
+         * @brief Performs the og history operation for SlotStatus.
+         *
+         * @param PC Input/output parameter used by this operation.
+         * @param DOCFAIL Input/output parameter used by this operation.
+         *
+         * @return Result produced by the og history operation.
+         */
+        logHistory(0, "-", "PC", "DOCFAIL");
+        /**
+         * @brief Performs the mit operation for SlotStatus.
+         *
+         * @param FAIL Input/output parameter used by this operation.
+         *
+         * @return Result produced by the mit operation.
+         */
+        emit("DOC FAIL");
+    }
+}
+
+bool Dispenser::parsePrescription(const String& body, Prescription& out) const
+{
+    // <patient>|<m1>|<m2>|<m3>
+    int p1 = body.indexOf('|');
+    int p2 = body.indexOf('|', p1 + 1);
+    int p3 = body.indexOf('|', p2 + 1);
+    if (p1 <= 0 || p2 < 0 || p3 < 0) return false;
+
+    out.patient     = body.substring(0, p1);
+    out.medicine[0] = "";
+    out.medicine[1] = body.substring(p1 + 1, p2);
+    out.medicine[2] = body.substring(p2 + 1, p3);
+    out.medicine[3] = body.substring(p3 + 1);
+
+    bool any = false;
+    for (int b = 1; b <= BOX_COUNT; b++)
+    {
+        out.medicine[b].trim();
+        if (out.medicine[b].length() == 0) out.medicine[b] = "-";
+        if (out.hasBox(b)) any = true;
+    }
+    out.patient.trim();
+    out.active = true;
+    return any && out.patient.length() > 0;
+}
+
+void Dispenser::receivePrescription(const String& body)
+{
+    /**
+     * @brief Performs the f operation for SlotStatus.
+     *
+     * @param doctor_ Input/output parameter used by this operation.
+     *
+     * @return Result produced by the f operation.
+     */
+    if (doctor_ == nullptr)       { emit("ERR doctor not logged in"); return; }
+    /**
+     * @brief Performs the f operation for SlotStatus.
+     *
+     * @param locked_ Input/output parameter used by this operation.
+     *
+     * @return Result produced by the f operation.
+     */
+    if (state_->moving() || locked_) { emit("ERR dispenser busy - try again when the boxes are closed"); return; }
+
+    Prescription rx;
+    /**
+     * @brief Performs the f operation for SlotStatus.
+     *
+     * @param rx Input/output parameter used by this operation.
+     *
+     * @return Result produced by the f operation.
+     */
+    if (!parsePrescription(body, rx)) { emit("ERR bad prescription"); return; }
+
+    doctorSince_ = millis();     // keep the doctor session alive
+    pending_     = rx;
+    hasPending_  = true;
+    /**
+     * @brief Performs the og history operation for SlotStatus.
+     *
+     * @param name Input/output parameter used by this operation.
+     * @param PC Input/output parameter used by this operation.
+     * @param patient Input/output parameter used by this operation.
+     *
+     * @return Result produced by the og history operation.
+     */
+    logHistory(0, doctor_->name, "PC", "RX " + rx.patient);
+
+    // Reset only when a previous patient's medicine is still loaded in a box.
+    // First prescription after start-up, or after everything was dispensed,
+    // goes straight to the refill.
+    bool needReset = false;
+    if (rx_.active)
+    {
+        for (int b = 1; b <= BOX_COUNT; b++)
+        {
+            if (slots_[b].status == SlotStatus::Loaded) needReset = true;
+        }
+    }
+
+    if (needReset)
+    {
+        /**
+         * @brief Performs the mit operation for SlotStatus.
+         *
+         * @param NEEDRESET Input/output parameter used by this operation.
+         *
+         * @return Result produced by the mit operation.
+         */
+        emit("NEEDRESET");
+        /**
+         * @brief Performs the hange state operation for SlotStatus.
+         *
+         * @param resetStartState_ Input/output parameter used by this operation.
+         *
+         * @return Result produced by the hange state operation.
+         */
+        changeState(&resetStartState_);
+    }
+    else
+    {
+        /**
+         * @brief Performs the ctivate pending prescription operation for SlotStatus.
+         *
+         * @return Result produced by the ctivate pending prescription operation.
+         */
+        activatePendingPrescription();
+        /**
+         * @brief Performs the o refill start operation for SlotStatus.
+         *
+         * @return Result produced by the o refill start operation.
+         */
+        goRefillStart();
+    }
+}
+
+void Dispenser::activatePendingPrescription()
+{
+    if (!hasPending_) return;
+    rx_ = pending_;
+    hasPending_ = false;
+
+    for (int b = 1; b <= BOX_COUNT; b++)
+    {
+        slots_[b].medicine   = rx_.medicine[b];
+        slots_[b].prescribed = rx_.hasBox(b);
+        slots_[b].status     = slots_[b].prescribed ? SlotStatus::Await : SlotStatus::Empty;
+    }
+
+    /**
+     * @brief Performs the end prescription operation for SlotStatus.
+     *
+     * @return Result produced by the end prescription operation.
+     */
+    sendPrescription();
+    for (int b = 1; b <= BOX_COUNT; b++) emitSlot(b);
+}
+
+// ------------------------------------------------------
+// Screens
+// ------------------------------------------------------
+void Dispenser::showCodeScreen(const char* title)
+{
+    String line2;
+    if (pin_.empty())
+    {
+        line2 = "Code + #";
+    }
+    else
+    {
+        line2 = "Code: ";
+        for (uint8_t i = 0; i < pin_.size(); i++) line2 += "*";
+    }
+    lcd_.show(title, line2);
+    /**
+     * @brief Performs the mit operation for SlotStatus.
+     *
+     * @param size Input/output parameter used by this operation.
+     *
+     * @return Result produced by the mit operation.
+     */
+    emit("PINLEN " + String(pin_.size()));
+}
+
+void Dispenser::showLoginScreen()
+{
+    String line1 = "Box" + String(selectedBox_) + ":" + BOX_NAMES[selectedBox_];
+
+    if (pin_.empty())
+    {
+        lcd_.show(line1, "Card/PIN# 0=Exit");
+    }
+    else
+    {
+        String masked = "";
+        for (uint8_t i = 0; i < pin_.size(); i++) masked += "*";
+        lcd_.show(line1, "PIN: " + masked);
+    }
+    /**
+     * @brief Performs the mit operation for SlotStatus.
+     *
+     * @param size Input/output parameter used by this operation.
+     *
+     * @return Result produced by the mit operation.
+     */
+    emit("PINLEN " + String(pin_.size()));
+}
+
+// ------------------------------------------------------
+// Login, failed tries, lockout
+// ------------------------------------------------------
+void Dispenser::tryLogin(const Authenticator& auth, const String& credential, const char* method)
+{
+    /**
+     * @brief Performs the ouch operation for SlotStatus.
+     *
+     * @return Result produced by the ouch operation.
+     */
+    touch();
+    User* user = auth.authenticate(credential);
+    pin_.clear();
+
+    /**
+     * @brief Performs the f operation for SlotStatus.
+     *
+     * @param user Input/output parameter used by this operation.
+     *
+     * @return Result produced by the f operation.
+     */
+    if (user != nullptr) handleUser(user, method);
+    /**
+     * @brief Processes a failed authentication attempt and lockout handling.
+     *
+     * @param failText Input/output parameter used by this operation.
+     * @param method Input/output parameter used by this operation.
+     *
+     * @return Result produced by the handle failed attempt operation.
+     */
+    else                 handleFailedAttempt(auth.failText(), method);
+}
+
+void Dispenser::handleUser(User* user, const char* method)
+{
+    /**
+     * @brief Performs the mit operation for SlotStatus.
+     *
+     * @param name Input/output parameter used by this operation.
+     *
+     * @return Result produced by the mit operation.
+     */
+    emit(String("AUTH ") + method + " " + user->name);
+    lcd_.show("Welcome!", user->name);
+    /**
+     * @brief Performs the elay operation for SlotStatus.
+     *
+     * @return Result produced by the elay operation.
+     */
+    delay(1000);
+
+    if (selectedBox_ <= user->level)
+    {
+        lastUser_   = user;
+        lastMethod_ = method;
+        /**
+         * @brief Performs the og history operation for SlotStatus.
+         *
+         * @param selectedBox_ Input/output parameter used by this operation.
+         * @param name Input/output parameter used by this operation.
+         * @param method Input/output parameter used by this operation.
+         * @param OPENED Input/output parameter used by this operation.
+         *
+         * @return Result produced by the og history operation.
+         */
+        logHistory(selectedBox_, user->name, method, "OPENED");
+        /**
+         * @brief Performs the tart dispense operation for SlotStatus.
+         *
+         * @return Result produced by the tart dispense operation.
+         */
+        startDispense();
+    }
+    else
+    {
+        /**
+         * @brief Performs the og history operation for SlotStatus.
+         *
+         * @param selectedBox_ Input/output parameter used by this operation.
+         * @param name Input/output parameter used by this operation.
+         * @param method Input/output parameter used by this operation.
+         * @param DENIED Input/output parameter used by this operation.
+         *
+         * @return Result produced by the og history operation.
+         */
+        logHistory(selectedBox_, user->name, method, "DENIED");
+        /**
+         * @brief Performs the mit operation for SlotStatus.
+         *
+         * @param name Input/output parameter used by this operation.
+         *
+         * @return Result produced by the mit operation.
+         */
+        emit("DENIED " + String(selectedBox_) + " " + user->name);
+        lcd_.show("Access Denied", "Not Authorised");
+        /**
+         * @brief Performs the elay operation for SlotStatus.
+         *
+         * @return Result produced by the elay operation.
+         */
+        delay(500);
+        /**
+         * @brief Performs the elay operation for SlotStatus.
+         *
+         * @return Result produced by the elay operation.
+         */
+        delay(1500);
+
+        /**
+         * @brief Performs the ouch operation for SlotStatus.
+         *
+         * @return Result produced by the ouch operation.
+         */
+        touch();
+        /**
+         * @brief Performs the how login screen operation for SlotStatus.
+         *
+         * @return Result produced by the how login screen operation.
+         */
+        showLoginScreen();
+    }
+}
+
+void Dispenser::handleFailedAttempt(const char* text, const char* method)
+{
+    attempts_++;
+    /**
+     * @brief Performs the og history operation for SlotStatus.
+     *
+     * @param selectedBox_ Input/output parameter used by this operation.
+     * @param method Input/output parameter used by this operation.
+     * @param FAILED Input/output parameter used by this operation.
+     *
+     * @return Result produced by the og history operation.
+     */
+    logHistory(selectedBox_, "-", method, "FAILED");
+    /**
+     * @brief Performs the mit operation for SlotStatus.
+     *
+     * @param MAX_ATTEMPTS Input/output parameter used by this operation.
+     *
+     * @return Result produced by the mit operation.
+     */
+    emit(String("FAIL ") + method + " " + String(attempts_) + " " + String(MAX_ATTEMPTS));
+
+    lcd_.show(text, "Access Denied");
+    /**
+     * @brief Performs the elay operation for SlotStatus.
+     *
+     * @return Result produced by the elay operation.
+     */
+    delay(500);
+    /**
+     * @brief Performs the elay operation for SlotStatus.
+     *
+     * @return Result produced by the elay operation.
+     */
+    delay(1200);
+
+    if (attempts_ >= MAX_ATTEMPTS)
+    {
+        locked_ = true;
+        /**
+         * @brief Performs the og history operation for SlotStatus.
+         *
+         * @param selectedBox_ Input/output parameter used by this operation.
+         * @param method Input/output parameter used by this operation.
+         * @param LOCKED Input/output parameter used by this operation.
+         *
+         * @return Result produced by the og history operation.
+         */
+        logHistory(selectedBox_, "-", method, "LOCKED");
+        /**
+         * @brief Performs the mit operation for SlotStatus.
+         *
+         * @param LOCKOUT_TIME Input/output parameter used by this operation.
+         *
+         * @return Result produced by the mit operation.
+         */
+        emit("LOCK " + String(LOCKOUT_TIME / 1000));
+        for (int s = LOCKOUT_TIME / 1000; s > 0; s--)
+        {
+            lcd_.show("Too Many Tries", "Wait " + String(s) + " s");
+            /**
+             * @brief Performs the elay operation for SlotStatus.
+             *
+             * @return Result produced by the elay operation.
+             */
+            delay(1000);
+        }
+        attempts_ = 0;
+        locked_   = false;
+        /**
+         * @brief Performs the mit operation for SlotStatus.
+         *
+         * @param UNLOCK Input/output parameter used by this operation.
+         *
+         * @return Result produced by the mit operation.
+         */
+        emit("UNLOCK");
+    }
+
+    pin_.clear();
+    /**
+     * @brief Performs the ouch operation for SlotStatus.
+     *
+     * @return Result produced by the ouch operation.
+     */
+    touch();
+    state_->redraw(*this);       // back to the same screen
+}
+
+void Dispenser::handleTimeout()
+{
+    /**
+     * @brief Performs the og history operation for SlotStatus.
+     *
+     * @param selectedBox_ Input/output parameter used by this operation.
+     * @param TIMEOUT Input/output parameter used by this operation.
+     *
+     * @return Result produced by the og history operation.
+     */
+    logHistory(selectedBox_, "-", "-", "TIMEOUT");
+    /**
+     * @brief Performs the mit operation for SlotStatus.
+     *
+     * @param TIMEOUT Input/output parameter used by this operation.
+     *
+     * @return Result produced by the mit operation.
+     */
+    emit("TIMEOUT");
+    lcd_.show("Session Timeout", "Start Again");
+    /**
+     * @brief Performs the elay operation for SlotStatus.
+     *
+     * @return Result produced by the elay operation.
+     */
+    delay(500);
+    /**
+     * @brief Performs the elay operation for SlotStatus.
+     *
+     * @return Result produced by the elay operation.
+     */
+    delay(1000);
+    /**
+     * @brief Performs the o ready operation for SlotStatus.
+     *
+     * @return Result produced by the o ready operation.
+     */
+    goReady();
+}
+
+// ------------------------------------------------------
+// Refill / dispense / reset results
+// ------------------------------------------------------
+void Dispenser::markRefilled()
+{
+    /**
+     * @brief Performs the mit operation for SlotStatus.
+     *
+     * @param REFILLED Input/output parameter used by this operation.
+     *
+     * @return Result produced by the mit operation.
+     */
+    emit("REFILLED");
+    /**
+     * @brief Performs the o refill finish operation for SlotStatus.
+     *
+     * @return Result produced by the o refill finish operation.
+     */
+    goRefillFinish();
+}
+
+void Dispenser::finishDispense(bool taken)
+{
+    int box = selectedBox_;
+    BoxSlot* s = slot(box);
+
+    if (taken)
+    {
+        /**
+         * @brief Performs the et slot operation for SlotStatus.
+         *
+         * @param box Input/output parameter used by this operation.
+         * @param Dispensed Input/output parameter used by this operation.
+         *
+         * @return Result produced by the et slot operation.
+         */
+        setSlot(box, SlotStatus::Dispensed);
+        /**
+         * @brief Performs the mit operation for SlotStatus.
+         *
+         * @param medicine Input/output parameter used by this operation.
+         *
+         * @return Result produced by the mit operation.
+         */
+        emit("DISPENSED " + String(box) + " " + s->medicine);
+        /**
+         * @brief Performs the og history operation for SlotStatus.
+         *
+         * @param box Input/output parameter used by this operation.
+         * @param name Input/output parameter used by this operation.
+         * @param lastMethod_ Input/output parameter used by this operation.
+         * @param DISPENSED Input/output parameter used by this operation.
+         *
+         * @return Result produced by the og history operation.
+         */
+        logHistory(box, lastUser_ ? lastUser_->name : "-", lastMethod_, "DISPENSED");
+        lcd_.show("Dispensed", s->medicine);
+    }
+    else
+    {
+        /**
+         * @brief Performs the mit operation for SlotStatus.
+         *
+         * @param box Input/output parameter used by this operation.
+         *
+         * @return Result produced by the mit operation.
+         */
+        emit("NOTTAKEN " + String(box));
+        /**
+         * @brief Performs the og history operation for SlotStatus.
+         *
+         * @param box Input/output parameter used by this operation.
+         * @param name Input/output parameter used by this operation.
+         * @param lastMethod_ Input/output parameter used by this operation.
+         * @param NOTTAKEN Input/output parameter used by this operation.
+         *
+         * @return Result produced by the og history operation.
+         */
+        logHistory(box, lastUser_ ? lastUser_->name : "-", lastMethod_, "NOTTAKEN");
+        lcd_.show("Not collected", "Box " + String(box) + " closed");
+        /**
+         * @brief Performs the elay operation for SlotStatus.
+         *
+         * @return Result produced by the elay operation.
+         */
+        delay(500);
+    }
+    /**
+     * @brief Performs the elay operation for SlotStatus.
+     *
+     * @return Result produced by the elay operation.
+     */
+    delay(1500);
+
+    if (allDispensed())
+    {
+        /**
+         * @brief Performs the mit operation for SlotStatus.
+         *
+         * @param patient Input/output parameter used by this operation.
+         *
+         * @return Result produced by the mit operation.
+         */
+        emit("RXCOMPLETE " + rx_.patient);
+        /**
+         * @brief Performs the og history operation for SlotStatus.
+         *
+         * @param patient Input/output parameter used by this operation.
+         * @param RXCOMPLETE Input/output parameter used by this operation.
+         *
+         * @return Result produced by the og history operation.
+         */
+        logHistory(0, rx_.patient, "-", "RXCOMPLETE");
+        /**
+         * @brief Performs the o complete operation for SlotStatus.
+         *
+         * @return Result produced by the o complete operation.
+         */
+        goComplete();
+    }
+    else
+    {
+        /**
+         * @brief Performs the o ready operation for SlotStatus.
+         *
+         * @return Result produced by the o ready operation.
+         */
+        goReady();
+    }
+}
+
+// Safety net, called every loop: once every prescribed medicine has been
+// dispensed, the dispenser must leave the dispensing screens.
+void Dispenser::checkCompletion()
+{
+    bool dispensingScreen = (state_ == &readyState_) || (state_ == &authState_);
+    if (dispensingScreen && rx_.active && allDispensed())
+    {
+        /**
+         * @brief Performs the mit operation for SlotStatus.
+         *
+         * @param patient Input/output parameter used by this operation.
+         *
+         * @return Result produced by the mit operation.
+         */
+        emit("RXCOMPLETE " + rx_.patient);
+        /**
+         * @brief Performs the o complete operation for SlotStatus.
+         *
+         * @return Result produced by the o complete operation.
+         */
+        goComplete();
+    }
+}
+
+// Refill the same prescription again (code entered on the COMPLETE screen)
+void Dispenser::refillSamePrescription()
+{
+    for (int b = 1; b <= BOX_COUNT; b++)
+    {
+        if (slots_[b].prescribed) slots_[b].status = SlotStatus::Await;
+        /**
+         * @brief Performs the mit slot operation for SlotStatus.
+         *
+         * @param b Input/output parameter used by this operation.
+         *
+         * @return Result produced by the mit slot operation.
+         */
+        emitSlot(b);
+    }
+    /**
+     * @brief Performs the og history operation for SlotStatus.
+     *
+     * @param patient Input/output parameter used by this operation.
+     * @param CODE Input/output parameter used by this operation.
+     * @param AGAIN Input/output parameter used by this operation.
+     *
+     * @return Result produced by the og history operation.
+     */
+    logHistory(0, rx_.patient, "CODE", "REFILL AGAIN");
+    /**
+     * @brief Performs the o refill operation for SlotStatus.
+     *
+     * @return Result produced by the o refill operation.
+     */
+    goRefill();
+}
+
+void Dispenser::finishReset()
+{
+    for (int i = 0; i < BOX_COUNT; i++) boxes_[i]->close();
+
+    for (int b = 1; b <= BOX_COUNT; b++)
+    {
+        slots_[b].status     = SlotStatus::Empty;
+        slots_[b].prescribed = false;
+        slots_[b].medicine   = "-";
+    }
+    rx_.active = false;
+
+    /**
+     * @brief Performs the mit operation for SlotStatus.
+     *
+     * @param EMPTIED Input/output parameter used by this operation.
+     *
+     * @return Result produced by the mit operation.
+     */
+    emit("EMPTIED");
+    /**
+     * @brief Performs the og history operation for SlotStatus.
+     *
+     * @param CODE Input/output parameter used by this operation.
+     * @param EMPTIED Input/output parameter used by this operation.
+     *
+     * @return Result produced by the og history operation.
+     */
+    logHistory(0, "-", "CODE", "EMPTIED");
+    lcd_.show("Emptied", "");
+    /**
+     * @brief Performs the elay operation for SlotStatus.
+     *
+     * @return Result produced by the elay operation.
+     */
+    delay(2000);
+
+    if (hasPending_)
+    {
+        /**
+         * @brief Performs the ctivate pending prescription operation for SlotStatus.
+         *
+         * @return Result produced by the ctivate pending prescription operation.
+         */
+        activatePendingPrescription();
+        /**
+         * @brief Performs the o refill start operation for SlotStatus.
+         *
+         * @return Result produced by the o refill start operation.
+         */
+        goRefillStart();
+    }
+    else
+    {
+        /**
+         * @brief Performs the end prescription operation for SlotStatus.
+         *
+         * @return Result produced by the end prescription operation.
+         */
+        sendPrescription();
+        for (int b = 1; b <= BOX_COUNT; b++) emitSlot(b);
+        /**
+         * @brief Performs the o idle operation for SlotStatus.
+         *
+         * @param Rx Input/output parameter used by this operation.
+         *
+         * @return Result produced by the o idle operation.
+         */
+        goIdle("Waiting for Rx");
+    }
+}
+
+
+// ######################################################
+//                  STATE IMPLEMENTATIONS
+// ######################################################
+
+// ---------- Idle ----------
+void IdleState::enter(Dispenser& d)
+{
+    d.resetSession();
+    d.rfid().setEnabled(false);
+    /**
+     * @brief Performs the edraw operation for SlotStatus.
+     *
+     * @param d Input/output parameter used by this operation.
+     *
+     * @return Result produced by the edraw operation.
+     */
+    redraw(d);
+}
+
+void IdleState::redraw(Dispenser& d)
+{
+    d.lcd().show("System Ready", d.idleMessage());
+}
+
+void IdleState::handle(Dispenser& d, const InputEvent& e)
+{
+    if (e.type == InputType::Key || e.type == InputType::SelectBox)
+    {
+        d.lcd().show("No prescription", "Ask the doctor");
+        /**
+         * @brief Performs the elay operation for SlotStatus.
+         *
+         * @return Result produced by the elay operation.
+         */
+        delay(1200);
+        /**
+         * @brief Performs the edraw operation for SlotStatus.
+         *
+         * @param d Input/output parameter used by this operation.
+         *
+         * @return Result produced by the edraw operation.
+         */
+        redraw(d);
+    }
+}
+
+// ---------- Code entry (shared by refill start/finish and reset) ----------
+void CodeEntryState::enter(Dispenser& d)
+{
+    d.pin().clear();
+    d.clearAttempts();
+    d.rfid().setEnabled(false);
+    /**
+     * @brief Performs the edraw operation for SlotStatus.
+     *
+     * @param d Input/output parameter used by this operation.
+     *
+     * @return Result produced by the edraw operation.
+     */
+    redraw(d);
+}
+
+void CodeEntryState::redraw(Dispenser& d)
+{
+    d.showCodeScreen(title());
+}
+
+void CodeEntryState::handle(Dispenser& d, const InputEvent& e)
+{
+    if (e.type != InputType::Key) return;   // the code must be typed on the dispenser
+    char k = e.key;
+
+    if (k >= '0' && k <= '9')
+    {
+        /**
+         * @brief Performs the f operation for SlotStatus.
+         *
+         * @param k Input/output parameter used by this operation.
+         *
+         * @return Result produced by the f operation.
+         */
+        if (d.pin().push(k)) { redraw(d); }
+    }
+    else if (k == 'B')
+    {
+        /**
+         * @brief Performs the f operation for SlotStatus.
+         *
+         * @param pop Input/output parameter used by this operation.
+         *
+         * @return Result produced by the f operation.
+         */
+        if (d.pin().pop()) { redraw(d); }
+    }
+    else if (k == '*')
+    {
+        d.pin().clear();
+        /**
+         * @brief Performs the edraw operation for SlotStatus.
+         *
+         * @param d Input/output parameter used by this operation.
+         *
+         * @return Result produced by the edraw operation.
+         */
+        redraw(d);
+    }
+    else if (k == '#')
+    {
+        String code = d.pin().toString();
+        d.pin().clear();
+
+        if (code == REFILL_CODE)
+        {
+            d.emit("CODE OK");
+            /**
+             * @brief Performs the n code accepted operation for SlotStatus.
+             *
+             * @param d Input/output parameter used by this operation.
+             *
+             * @return Result produced by the n code accepted operation.
+             */
+            onCodeAccepted(d);                 // subclass decides what comes next
+        }
+        else
+        {
+            d.handleFailedAttempt("Wrong code", "CODE");
+        }
+    }
+}
+
+/**
+ * @brief Handles a successfully entered refill/reset code.
+ *
+ * @param d Input/output parameter used by this operation.
+ */
+void RefillStartState::onCodeAccepted(Dispenser& d)  { d.goRefill(); }
+
+void RefillFinishState::onCodeAccepted(Dispenser& d)
+{
+    d.lcd().show("Medicine", "Dispenser Ready");
+    /**
+     * @brief Performs the elay operation for SlotStatus.
+     *
+     * @return Result produced by the elay operation.
+     */
+    delay(2000);
+    d.goReady();
+}
+
+/**
+ * @brief Handles a successfully entered refill/reset code.
+ *
+ * @param d Input/output parameter used by this operation.
+ */
+void ResetStartState::onCodeAccepted(Dispenser& d)   { d.goReset(); }
+
+// ---------- Complete ----------
+void CompleteState::redraw(Dispenser& d)
+{
+    /**
+     * @brief Performs the f operation for SlotStatus.
+     *
+     * @param Prescribe Input/output parameter used by this operation.
+     *
+     * @return Result produced by the f operation.
+     */
+    if (d.pin().empty()) d.lcd().show("All dispensed", "Refill/Prescribe");
+    else                 d.showCodeScreen("Refill: code");
+}
+
+void CompleteState::handle(Dispenser& d, const InputEvent& e)
+{
+    if (e.type == InputType::SelectBox || e.type == InputType::Pin)
+    {
+        d.emit("ERR all medicine dispensed - refill or prescribe");
+        return;
+    }
+    /**
+     * @brief Handles an input event while this dispenser state is active.
+     *
+     * @param d Input/output parameter used by this operation.
+     * @param e Input/output parameter used by this operation.
+     *
+     * @return Result produced by the handle operation.
+     */
+    CodeEntryState::handle(d, e);      // keypad: code + # refills the same prescription
+}
+
+/**
+ * @brief Handles a successfully entered refill/reset code.
+ *
+ * @param d Input/output parameter used by this operation.
+ */
+void CompleteState::onCodeAccepted(Dispenser& d) { d.refillSamePrescription(); }
+
+// ---------- Refill: one prescribed box at a time ----------
+void RefillState::enter(Dispenser& d)
+{
+
+    // Queue the prescribed boxes in order 1, 2, 3
+    d.refillQueue().clear();
+    for (int b = 1; b <= BOX_COUNT; b++)
+    {
+        /**
+         * @brief Performs the f operation for SlotStatus.
+         *
+         * @param b Input/output parameter used by this operation.
+         *
+         * @return Result produced by the f operation.
+         */
+        if (d.slot(b)->prescribed) d.refillQueue().push(b);
+    }
+    /**
+     * @brief Performs the ext box operation for SlotStatus.
+     *
+     * @param d Input/output parameter used by this operation.
+     *
+     * @return Result produced by the ext box operation.
+     */
+    nextBox(d);
+}
+
+void RefillState::nextBox(Dispenser& d)
+{
+    int b;
+    if (!d.refillQueue().pop(b))
+    {
+        box_ = 0;
+        d.markRefilled();
+        return;
+    }
+
+    box_        = b;
+    detectedAt_ = 0;
+    d.setSlot(b, SlotStatus::Await);
+    d.emit("REFILL " + String(b));
+    d.servo(b)->open();
+    /**
+     * @brief Performs the edraw operation for SlotStatus.
+     *
+     * @param d Input/output parameter used by this operation.
+     *
+     * @return Result produced by the edraw operation.
+     */
+    redraw(d);
+}
+
+void RefillState::redraw(Dispenser& d)
+{
+    if (box_ == 0) return;
+    d.lcd().show("REFILLING Box " + String(box_), d.slot(box_)->medicine);
+}
+
+void RefillState::update(Dispenser& d)
+{
+    if (box_ == 0) return;
+
+    if (!d.ir(box_)->present())
+    {
+        /**
+         * @brief Performs the f operation for SlotStatus.
+         *
+         * @param detectedAt_ Input/output parameter used by this operation.
+         *
+         * @return Result produced by the f operation.
+         */
+        if (detectedAt_ != 0) { detectedAt_ = 0; redraw(d); }   // taken out again
+        return;
+    }
+
+    /**
+     * @brief Performs the f operation for SlotStatus.
+     *
+     * @param detectedAt_ Input/output parameter used by this operation.
+     *
+     * @return Result produced by the f operation.
+     */
+    if (detectedAt_ == 0) detectedAt_ = millis();
+    unsigned long elapsed = millis() - detectedAt_;
+
+    if (elapsed >= CLOSE_DELAY)
+    {
+        d.servo(box_)->close();
+        d.setSlot(box_, SlotStatus::Loaded);
+        d.emit("LOADED " + String(box_));
+        d.logHistory(box_, d.slot(box_)->medicine, "IR", "LOADED");
+        /**
+         * @brief Performs the elay operation for SlotStatus.
+         *
+         * @return Result produced by the elay operation.
+         */
+        delay(600);
+        /**
+         * @brief Performs the ext box operation for SlotStatus.
+         *
+         * @param d Input/output parameter used by this operation.
+         *
+         * @return Result produced by the ext box operation.
+         */
+        nextBox(d);
+    }
+    else
+    {
+        unsigned long left = (CLOSE_DELAY - elapsed + 999) / 1000;
+        d.lcd().show("Box " + String(box_) + " detected", "Closing in " + String(left) + " s");
+    }
+}
+
+// ---------- Ready: choose a box ----------
+void ReadyState::enter(Dispenser& d)
+{
+    d.resetSession();
+    d.rfid().setEnabled(false);
+    /**
+     * @brief Performs the edraw operation for SlotStatus.
+     *
+     * @param d Input/output parameter used by this operation.
+     *
+     * @return Result produced by the edraw operation.
+     */
+    redraw(d);
+}
+
+void ReadyState::redraw(Dispenser& d)
+{
+    d.lcd().show("Dispenser Ready", "Select Box 1-3");
+}
+
+void ReadyState::choose(Dispenser& d, int box)
+{
+    BoxSlot* s = d.slot(box);
+    /**
+     * @brief Performs the f operation for SlotStatus.
+     *
+     * @param s Input/output parameter used by this operation.
+     *
+     * @return Result produced by the f operation.
+     */
+    if (s == nullptr) { d.emit("ERR box must be 1, 2 or 3"); return; }
+
+    if (s->status == SlotStatus::Loaded)
+    {
+        d.selectBox(box);
+        return;
+    }
+
+    const char* why = !s->prescribed                         ? "Not prescribed"
+                    : (s->status == SlotStatus::Dispensed)    ? "Already given"
+                                                              : "Empty";
+    d.emit("ERR box " + String(box) + ": " + why);
+    d.lcd().show("Box " + String(box), why);
+    /**
+     * @brief Performs the elay operation for SlotStatus.
+     *
+     * @return Result produced by the elay operation.
+     */
+    delay(500);
+    /**
+     * @brief Performs the elay operation for SlotStatus.
+     *
+     * @return Result produced by the elay operation.
+     */
+    delay(1200);
+    /**
+     * @brief Performs the edraw operation for SlotStatus.
+     *
+     * @param d Input/output parameter used by this operation.
+     *
+     * @return Result produced by the edraw operation.
+     */
+    redraw(d);
+}
+
+void ReadyState::handle(Dispenser& d, const InputEvent& e)
+{
+    /**
+     * @brief Performs the f operation for SlotStatus.
+     *
+     * @param type Input/output parameter used by this operation.
+     *
+     * @return Result produced by the f operation.
+     */
+    if (e.type == InputType::Key && e.key >= '1' && e.key <= '3') choose(d, e.key - '0');
+    else if (e.type == InputType::SelectBox)                         choose(d, e.box);
+    else if (e.type == InputType::Pin)                               d.emit("ERR select a box first");
+}
+
+// ---------- Authenticate ----------
+void AuthenticateState::enter(Dispenser& d)
+{
+    d.pin().clear();
+    d.touch();
+    d.emit("STATE AUTH " + String(d.selectedBox()));
+    /**
+     * @brief Performs the edraw operation for SlotStatus.
+     *
+     * @param d Input/output parameter used by this operation.
+     *
+     * @return Result produced by the edraw operation.
+     */
+    redraw(d);
+    d.rfid().setEnabled(true);
+}
+
+/**
+ * @brief Refreshes the LCD for the current dispenser state.
+ *
+ * @param d Input/output parameter used by this operation.
+ */
+void AuthenticateState::redraw(Dispenser& d) { d.showLoginScreen(); }
+
+void AuthenticateState::handle(Dispenser& d, const InputEvent& e)
+{
+    switch (e.type)
+    {
+        case InputType::Key:
+        {
+            d.touch();
+            char k = e.key;
+            if (k == '0')
+            {
+                d.lcd().show("Exiting...", "");
+                /**
+                 * @brief Performs the elay operation for SlotStatus.
+                 *
+                 * @return Result produced by the elay operation.
+                 */
+                delay(500);
+                d.goReady();
+            }
+            else if (k >= '1' && k <= '9') { if (d.pin().push(k)) { redraw(d); } }
+            else if (k == 'B')             { if (d.pin().pop())   { redraw(d); } }
+            else if (k == '*')             { d.pin().clear(); redraw(d); }
+            else if (k == '#')
+            {
+                /**
+                 * @brief Performs the f operation for SlotStatus.
+                 *
+                 * @param PIN Input/output parameter used by this operation.
+                 *
+                 * @return Result produced by the f operation.
+                 */
+                if (d.pin().full()) d.tryLogin(d.pinAuth(), d.pin().toString(), "PIN");
+                else
+                {
+                    d.lcd().show("Enter 4 Digit", "PIN First");
+                    /**
+                     * @brief Performs the elay operation for SlotStatus.
+                     *
+                     * @return Result produced by the elay operation.
+                     */
+                    delay(1000);
+                    /**
+                     * @brief Performs the edraw operation for SlotStatus.
+                     *
+                     * @param d Input/output parameter used by this operation.
+                     *
+                     * @return Result produced by the edraw operation.
+                     */
+                    redraw(d);
+                }
+            }
+            break;
+        }
+
+        case InputType::Card:
+            d.emit("CARD " + e.text);
+            d.tryLogin(d.rfidAuth(), e.text, "CARD");
+            break;
+
+        case InputType::Pin:
+        {
+            bool valid = (e.text.length() == PIN_LENGTH);
+            for (unsigned int i = 0; i < e.text.length(); i++) if (e.text[i] < '1' || e.text[i] > '9') valid = false;
+            /**
+             * @brief Performs the f operation for SlotStatus.
+             *
+             * @param to Input/output parameter used by this operation.
+             *
+             * @return Result produced by the f operation.
+             */
+            if (!valid) d.emit("ERR PIN must be 4 digits from 1 to 9");
+            else        d.tryLogin(d.pinAuth(), e.text, "PC");
+            break;
+        }
+
+        case InputType::Clear: d.pin().clear(); redraw(d); break;
+        case InputType::Exit:  d.lcd().show("Exiting...", ""); delay(300); d.goReady(); break;
+        case InputType::SelectBox: d.emit("ERR exit the current login first"); break;
+        default: break;
+    }
+}
+
+void AuthenticateState::update(Dispenser& d)
+{
+    /**
+     * @brief Performs the f operation for SlotStatus.
+     *
+     * @param handleTimeout Input/output parameter used by this operation.
+     *
+     * @return Result produced by the f operation.
+     */
+    if (d.timedOut()) d.handleTimeout();
+}
+
+// ---------- Dispense ----------
+void DispenseState::enter(Dispenser& d)
+{
+    d.rfid().setEnabled(false);
+    d.servo(d.selectedBox())->open();
+    openedAt_ = millis();
+    takenAt_  = 0;
+    /**
+     * @brief Performs the edraw operation for SlotStatus.
+     *
+     * @param d Input/output parameter used by this operation.
+     *
+     * @return Result produced by the edraw operation.
+     */
+    redraw(d);
+}
+
+void DispenseState::redraw(Dispenser& d)
+{
+    d.lcd().show("Take medicine", d.slot(d.selectedBox())->medicine);
+}
+
+void DispenseState::update(Dispenser& d)
+{
+    int box = d.selectedBox();
+    unsigned long now = millis();
+
+    if (!d.ir(box)->present())
+    {
+        // Medicine taken: close 5 s later
+        if (takenAt_ == 0) takenAt_ = now;
+        unsigned long elapsed = now - takenAt_;
+
+        if (elapsed >= CLOSE_DELAY)
+        {
+            d.servo(box)->close();
+            d.finishDispense(true);
+            return;
+        }
+        unsigned long left = (CLOSE_DELAY - elapsed + 999) / 1000;
+        d.lcd().show("Medicine taken", "Closing in " + String(left) + " s");
+        return;
+    }
+
+    // Still inside (or put back)
+    /**
+     * @brief Performs the f operation for SlotStatus.
+     *
+     * @param takenAt_ Input/output parameter used by this operation.
+     *
+     * @return Result produced by the f operation.
+     */
+    if (takenAt_ != 0) { takenAt_ = 0; redraw(d); }
+
+    if (now - openedAt_ >= COLLECT_TIMEOUT)
+    {
+        d.servo(box)->close();
+        d.finishDispense(false);
+        return;
+    }
+
+    unsigned long left = (COLLECT_TIMEOUT - (now - openedAt_) + 999) / 1000;
+    d.lcd().show("Take med: " + String(left) + " s", d.slot(box)->medicine);
+}
+
+// ---------- Reset: open all, wait until every box is empty ----------
+void ResetState::enter(Dispenser& d)
+{
+    for (int b = 1; b <= BOX_COUNT; b++) d.servo(b)->open();
+    emptySince_ = 0;
+}
+
+void ResetState::update(Dispenser& d)
+{
+    String left = "";
+    for (int b = 1; b <= BOX_COUNT; b++)
+    {
+        /**
+         * @brief Performs the f operation for SlotStatus.
+         *
+         * @param left Input/output parameter used by this operation.
+         *
+         * @return Result produced by the f operation.
+         */
+        if (d.ir(b)->present()) left += (left.length() ? " " : "") + String(b);
+    }
+
+    if (left.length() > 0)
+    {
+        emptySince_ = 0;
+        d.lcd().show("RESET: empty box", "Remove: " + left);
+        return;
+    }
+
+    /**
+     * @brief Performs the f operation for SlotStatus.
+     *
+     * @param emptySince_ Input/output parameter used by this operation.
+     *
+     * @return Result produced by the f operation.
+     */
+    if (emptySince_ == 0) emptySince_ = millis();
+    if (millis() - emptySince_ >= EMPTY_CONFIRM)
+    {
+        d.finishReset();
+        return;
+    }
+    d.lcd().show("All boxes empty", "Checking...");
+}
+
+
+// ######################################################
+//                  ARDUINO ENTRY POINTS
+// ######################################################
+
+void setup()
+{
+    Serial.begin(115200);
+    /**
+     * @brief Performs the elay operation for SlotStatus.
+     *
+     * @return Result produced by the elay operation.
+     */
+    delay(300);                       // give the USB port a moment
+    /**
+     * @brief Returns the singleton medicine-dispenser controller instance.
+     *
+     * @param begin Input/output parameter used by this operation.
+     *
+     * @return Result produced by the instance operation.
+     */
+    Dispenser::instance().begin();
+}
+
+void loop()
+{
+    /**
+     * @brief Returns the singleton medicine-dispenser controller instance.
+     *
+     * @param loop Input/output parameter used by this operation.
+     *
+     * @return Result produced by the instance operation.
+     */
+    Dispenser::instance().loop();
+}
